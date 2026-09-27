@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+# agenttalk — the command-line half of the AgentTalk Omarchy plugin.
+#
+# The panel (QML) is a view: it renders an event log and shells out to this
+# script for everything that touches the disk or a process. Keeping the work
+# here means the panel has no privileged logic, the awkward parts (process
+# groups, JSON normalization, cwd resolution) are testable from a terminal, and
+# an agent run keeps going when the panel closes or the shell reloads.
+#
+# One conversation per agent, stored as an append-only event log:
+#
+#   $STATE/agents/<agent>/meta.json     session id, workdir, pid, exit code
+#   $STATE/agents/<agent>/events.jsonl  one normalized event per line
+#   $STATE/agents/<agent>/stderr.log    raw stderr of the last run
+#
+# Subcommands:
+#   agents                        list agents as JSON
+#   init <agent>                  make sure an agent's session files exist
+#   append <agent> <json>         append one event to an agent's log
+#   run <agent> <prompt>          start a turn (detached)
+#   clear <agent>                 forget the conversation
+#   stop <agent>                  stop the running turn
+#   cwd                           working directory for the focused window
+#   state-dir                     print the state directory
+#
+# Environment:
+#   AGENTTALK_OPENCODE_BIN  opencode binary to use (default: opencode)
+#   AGENTTALK_STATE_DIR     state directory override
+#   AGENTTALK_TIMEOUT       seconds before a run is killed (default: 3600)
+
+set -uo pipefail
+
+STATE_DIR="${AGENTTALK_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agenttalk}"
+OPENCODE_BIN="${AGENTTALK_OPENCODE_BIN:-opencode}"
+RUN_TIMEOUT="${AGENTTALK_TIMEOUT:-3600}"
+
+log() { printf 'agenttalk: %s\n' "$*" >&2; }
+
+agent_dir() {
+  local id="${1:-}"
+  if [[ -z "$id" || "$id" == *"/"* || "$id" == "." || "$id" == ".." ]]; then
+    log "invalid agent id: '$id'"
+    return 1
+  fi
+  printf '%s/agents/%s' "$STATE_DIR" "$id"
+}
+
+read_pid() {
+  local dir="$1"
+  [[ -f "$dir/meta.json" ]] || return 0
+  jq -r '.pid // 0' "$dir/meta.json" 2>/dev/null || echo 0
+}
+
+# ---------------------------------------------------------------- agents
+
+cmd_agents() {
+  if ! command -v "$OPENCODE_BIN" >/dev/null 2>&1; then
+    echo '[]'
+    return 0
+  fi
+
+  local list
+  list=$("$OPENCODE_BIN" agent list 2>/dev/null)
+  [[ -n "$list" ]] || { echo '[]'; return 0; }
+
+  local first=1
+  printf '['
+  while IFS= read -r line; do
+    # Agent headings sit in column 0; everything under them is the indented
+    # permission block.
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$line" =~ ^[[:space:]] ]] && continue
+
+    local id mode
+    if [[ "$line" =~ ^([^[:space:]]+)[[:space:]]+\((primary|subagent|all)\)$ ]]; then
+      id="${BASH_REMATCH[1]}"
+      mode="${BASH_REMATCH[2]}"
+    else
+      id="${line%%[[:space:]]*}"
+      mode="all"
+    fi
+    [[ -z "$id" ]] && continue
+    # The permission block below a heading is indented but for its closing
+    # bracket, which lands in column 0 like a heading does.
+    [[ "$id" =~ ^[][{}(),]+$ ]] && continue
+
+    [[ $first -eq 0 ]] && printf ','
+    first=0
+    jq -nc --arg id "$id" --arg mode "$mode" '{id: $id, mode: $mode}'
+  done <<<"$list"
+  printf ']\n'
+}
+
+# ---------------------------------------------------------------- append
+
+cmd_append() {
+  local dir
+  dir=$(agent_dir "${1:-}") || return 1
+  local line="${2:-}"
+  [[ -z "$line" ]] && { log "append needs a JSON event"; return 1; }
+  jq -e . >/dev/null 2>&1 <<<"$line" || { log "append needs valid JSON"; return 1; }
+  mkdir -p "$dir" || return 1
+  # A single small line, appended with >> : the worker appends the same way,
+  # so the only thing that matters is that a line never lands in two pieces.
+  printf '%s\n' "$line" >>"$dir/events.jsonl"
+}
+
+# ------------------------------------------------------------------- cwd
+
+# The directory a human would expect the agent to work in: where the focused
+# window is. Falls back to $HOME when the window is not a process we can read.
+cmd_cwd() {
+  local pid="" dir=""
+  if command -v hyprctl >/dev/null 2>&1; then
+    pid=$(hyprctl -j activewindow 2>/dev/null | jq -r '.pid // 0' 2>/dev/null)
+  fi
+  if [[ "$pid" =~ ^[0-9]+$ ]] && [[ "$pid" != "0" ]] && [[ -e "/proc/$pid/cwd" ]]; then
+    dir=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
+  fi
+  if [[ -n "$dir" && -d "$dir" ]]; then
+    printf '%s\n' "$dir"
+  else
+    printf '%s\n' "$HOME"
+  fi
+}
+
+# ------------------------------------------------------------------- init
+
+# Make sure an agent has a session directory with the two files the panel
+# watches, so a FileView never has to watch something that does not exist.
+cmd_init() {
+  local dir
+  dir=$(agent_dir "${1:-}") || return 1
+  mkdir -p "$dir" || return 1
+  [[ -f "$dir/events.jsonl" ]] || : >"$dir/events.jsonl"
+  [[ -f "$dir/meta.json" ]] && return 0
+  jq -nc --arg agent "${1:-}" \
+    '{agent: $agent, sessionID: "", workdir: "", running: false, pid: 0, exitCode: null}' \
+    >"$dir/meta.json"
+}
+
+# ------------------------------------------------------------------ clear
+
+cmd_clear() {
+  local dir
+  dir=$(agent_dir "${1:-}") || return 1
+  local pid
+  pid=$(read_pid "$dir")
+  if [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill -TERM -- "-$pid" 2>/dev/null
+    sleep 0.3
+  fi
+  rm -f "$dir/events.jsonl" "$dir/meta.json" "$dir/stderr.log"
+  mkdir -p "$dir"
+  : >"$dir/events.jsonl"
+  jq -nc --arg agent "${1:-}" '{agent: $agent, sessionID: "", running: false, pid: 0}' >"$dir/meta.json"
+}
+
+# ------------------------------------------------------------------- stop
+
+cmd_stop() {
+  local dir
+  dir=$(agent_dir "${1:-}") || return 1
+  local agent="${1:-}"
+  local pid
+  pid=$(read_pid "$dir")
+  if [[ "$pid" == "0" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    log "no run in progress"
+    return 0
+  fi
+
+  # Prefer the opencode process itself: killing the worker's whole group would
+  # take the worker down before it can record how the run ended.
+  local runpid=""
+  [[ -f "$dir/run.pid" ]] && runpid=$(<"$dir/run.pid")
+  if [[ "$runpid" =~ ^[0-9]+$ ]] && kill -0 "$runpid" 2>/dev/null; then
+    kill -TERM "$runpid" 2>/dev/null
+    return 0
+  fi
+
+  # The worker is a session leader, so its pid is also its process group id.
+  # This path means the run is already unravelling; kill it and close the log
+  # ourselves, because nothing is left that will.
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  sleep 0.3
+  mkdir "$dir/.finalized" 2>/dev/null
+  jq -nc '{t: "error", text: "the run was stopped"}' >>"$dir/events.jsonl"
+  jq -nc '{t: "done", code: 143}' >>"$dir/events.jsonl"
+  jq -c '.running = false | .pid = 0 | .exitCode = 143' "$dir/meta.json" >"$dir/meta.json.tmp" \
+    && mv "$dir/meta.json.tmp" "$dir/meta.json"
+  rm -f "$dir/run.pid"
+  log "stopped $agent"
+}
+
+# -------------------------------------------------------------------- run
+
+# Turn opencode's raw JSON event stream into the handful of shapes the panel
+# knows how to draw. Anything we do not recognize is dropped rather than
+# forwarded, so the panel never has to know about steps or messages.
+normalize_stream() {
+  local -a filter=(
+    'if .type == "text" and ((.part.text // "") | length) > 0
+       then {t: "text", text: .part.text}
+     elif .type == "tool_use"
+       then {t: "tool", tool: (.part.tool // "tool"),
+             status: (.part.state.status // "running"),
+             title: (.part.state.title // "")}
+     elif .type == "error" or .part.type == "error"
+       then {t: "error", text: ((.part.error // .error // "run failed") | tostring)}
+     elif ((.sessionID // "") | length) > 0
+       then {t: "session", id: .sessionID}
+     else empty end'
+  )
+  local line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    jq -c "${filter[@]}" <<<"$line" 2>/dev/null || true
+  done
+}
+
+# The detached half of `run`. Writes the session id, the running flag and the
+# pids to meta.json, streams normalized events into the log, and always finishes
+# through `finalize` so the panel can never be left showing a run that is not
+# running.
+worker() {
+  local agent="$1" prompt_file="$2" workdir="$3" auto="$4" fresh="$5"
+  local dir events meta
+  dir=$(agent_dir "$agent") || return 1
+  events="$dir/events.jsonl"
+  meta="$dir/meta.json"
+  mkdir -p "$dir"
+  touch "$events"
+
+  # `finalize` may run from a signal handler as well as from the happy path, so
+  # it takes a lock rather than trusting to be called once. `run` clears the
+  # lock before it spawns the next worker.
+  local lock="$dir/.finalized"
+
+  finalize() {
+    local code="$1"
+    mkdir "$lock" 2>/dev/null || return 0
+    if [[ "$code" == "124" ]]; then
+      jq -nc --arg t "the run exceeded ${RUN_TIMEOUT}s and was stopped" \
+        '{t: "error", text: $t}' >>"$events"
+    fi
+    jq -nc --argjson code "$code" '{t: "done", code: $code}' >>"$events"
+    jq -c --argjson code "$code" --arg s "$session_id" \
+      '.running = false | .pid = 0 | .exitCode = $code | .sessionID = $s' \
+      <<<"$current" >"$meta"
+    rm -f "$dir/run.pid"
+  }
+  trap 'finalize 143' TERM INT HUP
+
+  local session_id=""
+  if [[ "$fresh" == "false" && -f "$meta" ]]; then
+    session_id=$(jq -r '.sessionID // ""' "$meta" 2>/dev/null)
+  fi
+
+  local -a args=(run --format json)
+  [[ "$agent" != "" ]] && args+=(--agent "$agent")
+  [[ -n "$session_id" ]] && args+=(--session "$session_id")
+  [[ "$auto" == "true" ]] && args+=(--auto)
+
+  local prompt
+  prompt=$(cat "$prompt_file" 2>/dev/null)
+  rm -f "$prompt_file"
+
+  local current=""
+  current=$(jq -c --arg agent "$agent" --arg workdir "$workdir" --arg session "$session_id" \
+    '{
+       agent: $agent,
+       sessionID: $session,
+       workdir: $workdir,
+       running: true,
+       pid: 0,
+       startedAt: now,
+       exitCode: null
+     }' 2>/dev/null <<<"{}") || current='{}'
+
+  # $$ is this worker's pid and, because setsid made it a session leader, also
+  # its process group id: a group kill gets the whole run, signal handling
+  # included.
+  current=$(jq -c --argjson pid "$$" '.pid = $pid' <<<"$current")
+  printf '%s\n' "$current" >"$meta"
+
+  local status=0
+  # The subshell's own pid survives `exec`, so run.pid stays a valid handle on
+  # `timeout` for as long as the run lasts. `stop` signals that instead of the
+  # group: killing the group would take this worker down with it, and the run
+  # would end with a log that never says so.
+  (
+    cd "$workdir" || exit 1
+    printf '%s\n' "$BASHPID" >"$dir/run.pid"
+    exec timeout --kill-after=10 "$RUN_TIMEOUT" "$OPENCODE_BIN" "${args[@]}" "$prompt"
+  ) 2>"$dir/stderr.log" </dev/null \
+    | normalize_stream \
+    | while IFS= read -r event; do
+        printf '%s\n' "$event" >>"$events"
+        # Every raw event carries the session id. The first one is all the next
+        # turn needs to continue this conversation instead of starting over.
+        if [[ -z "$session_id" && "$event" == '{"t":"session"'* ]]; then
+          session_id=$(jq -r '.id // ""' <<<"$event" 2>/dev/null)
+          jq -c --arg s "$session_id" '.sessionID = $s' <<<"$current" >"$meta"
+        fi
+      done
+  status=${PIPESTATUS[0]}
+
+  # The loop above ran in a subshell, so pick the session id back up from disk.
+  session_id=$(jq -r '.sessionID // ""' "$meta" 2>/dev/null)
+
+  finalize "$status"
+}
+
+cmd_run() {
+  local agent="${1:-}" prompt="${2:-}"
+  shift 2 2>/dev/null || true
+  local auto="false" fresh="false" workdir=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --auto) auto="true" ;;
+      --new) fresh="true" ;;
+      --dir) workdir="${2:-}"; shift ;;
+      --dir=*) workdir="${1#--dir=}" ;;
+      *) log "unknown option: $1" ;;
+    esac
+    shift
+  done
+
+  [[ -n "$agent" ]] || { log "run needs an agent id"; return 1; }
+  [[ -n "${prompt//[[:space:]]/}" ]] || { log "run needs a prompt"; return 1; }
+
+  if ! command -v "$OPENCODE_BIN" >/dev/null 2>&1; then
+    log "$OPENCODE_BIN is not on PATH"
+    return 127
+  fi
+
+  [[ -d "$workdir" ]] || workdir=$(cmd_cwd)
+  [[ -d "$workdir" ]] || workdir="$HOME"
+
+  local dir
+  dir=$(agent_dir "$agent") || return 1
+  mkdir -p "$dir"
+
+  local pid
+  pid=$(read_pid "$dir")
+  if [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null; then
+    log "$agent is already running (pid $pid)"
+    return 1
+  fi
+
+  # The lock belongs to the previous run; the new worker takes it.
+  rm -rf "$dir/.finalized"
+  rm -f "$dir/run.pid"
+
+  # The prompt goes through a file rather than argv: a pasted stack trace can
+  # be long, and this keeps it out of every `ps` on the machine while the run
+  # lasts. The worker deletes it when it is done.
+  local prompt_file
+  prompt_file=$(mktemp "$dir/prompt.XXXXXX") || return 1
+  printf '%s' "$prompt" >"$prompt_file"
+
+  local self="$0"
+  setsid nohup "$self" --worker "$agent" "$prompt_file" "$workdir" "$auto" "$fresh" \
+    >/dev/null 2>&1 </dev/null &
+  disown 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------- main
+
+case "${1:-}" in
+  agents) shift; cmd_agents "$@" ;;
+  init) shift; cmd_init "${1:-}" ;;
+  append) shift; cmd_append "$@" ;;
+  run) shift; cmd_run "$@" ;;
+  clear) shift; cmd_clear "${1:-}" ;;
+  stop) shift; cmd_stop "${1:-}" ;;
+  cwd) shift; cmd_cwd "$@" ;;
+  state-dir) printf '%s\n' "$STATE_DIR" ;;
+  --worker)
+    shift
+    worker "$@"
+    ;;
+  *)
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

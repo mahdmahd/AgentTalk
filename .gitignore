@@ -1,0 +1,4 @@
+# Nothing generated belongs in the repository: the plugin folder is the source.
+*.log
+*.swp
+.DS_Store
