@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell
 import Quickshell.Io
 import "Model.js" as Model
 
@@ -24,27 +25,39 @@ Item {
   property var meta: ({})
   property var blocks: []
   property int dropped: 0
+  // The raw text behind `blocks`. A block count is not enough to tell two reads
+  // apart: clearing a conversation and never having had one both leave zero
+  // blocks, and a rewritten block keeps the count too.
+  property string eventsRaw: ""
+  property string metaRaw: ""
 
   readonly property bool running: !!(meta && meta.running === true)
   readonly property string workdir: (meta && meta.workdir) ? String(meta.workdir) : ""
+  // Whether `workdir` is the one the user picked, as opposed to the directory
+  // of the window they happened to be looking at. The panel shows a different
+  // label for each, because only a pinned one survives moving to another window.
+  readonly property bool workdirPinned: !!(meta && meta.workdirPinned === true)
 
   // Fires whenever the transcript grew, so the panel can badge an agent the
   // user is not currently looking at.
   signal transcriptGrew()
 
   function loadMeta(content) {
-    var parsed = {}
+    var text = String(content === undefined || content === null ? "" : content)
+    if (text === metaRaw) return
+    metaRaw = text
     try {
-      parsed = JSON.parse(String(content === undefined || content === null ? "" : content)) || {}
+      meta = JSON.parse(text) || {}
     } catch (e) {
-      parsed = {}
+      meta = {}
     }
-    meta = parsed
   }
 
   function loadEvents(content) {
-    var parsed = Model.parseEvents(content)
-    if (parsed.blocks.length === blocks.length && parsed.dropped === dropped) return
+    var text = String(content === undefined || content === null ? "" : content)
+    if (text === eventsRaw) return
+    var parsed = Model.parseEvents(text)
+    eventsRaw = text
     blocks = parsed.blocks
     dropped = parsed.dropped
     transcriptGrew()

@@ -59,7 +59,13 @@ function parseEvents(content) {
 
     switch (String(event.t)) {
       case "user":
-        pushBlock(blocks, {kind: "user", text: String(event.text === undefined ? "" : event.text)})
+        pushBlock(blocks, {
+          kind: "user",
+          text: String(event.text === undefined ? "" : event.text),
+          // The directory this question was asked in, as the worker resolved
+          // it. Empty for a run that predates the field.
+          workdir: String(event.workdir === undefined ? "" : event.workdir)
+        })
         break
       case "text":
         pushBlock(blocks, {kind: "text", text: String(event.text === undefined ? "" : event.text)})

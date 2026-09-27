@@ -2,14 +2,14 @@
   "schemaVersion": 1,
   "id": "io.github.ramackersjp.agenttalk",
   "name": "AgentTalk",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "J.P. Ramackers",
   "license": "MIT",
   "description": "Talk to your opencode agents from a panel in the Omarchy bar: type a task or paste an error, pick the agent, and watch it work.",
   "kinds": ["bar-widget"],
   "activation": "on-demand",
   "entryPoints": {
-    "barWidget": "Panel.qml"
+    "barWidget": "BarWidget.qml"
   },
   "barWidget": {
     "displayName": "AgentTalk",

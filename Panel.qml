@@ -7,8 +7,9 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// The whole product lives in one file: a bar button, and the panel it opens.
-// Agents down the left, the conversation on the right, the input at the bottom.
+// The panel half of AgentTalk: agents down the left, the conversation on the
+// right, the input at the bottom. `BarWidget.qml` is the manifest entry point
+// and loads this file; the shell never loads it directly.
 //
 // The panel owns no agent logic. It renders the event log `bin/agenttalk`
 // writes and asks that script to start, stop or clear a conversation, which
@@ -18,7 +19,16 @@ import "Model.js" as Model
 Panel {
   id: root
   moduleName: "io.github.ramackersjp.agenttalk"
-  ipcTarget: "io.github.ramackersjp.agenttalk"
+  // The bar widget owns the open/close route: the shell hands `summon`,
+  // `toggle` and `hide` to the live bar instance, and a per-target IPC handler
+  // here would only ever reach whichever monitor claimed the target.
+  manageIpc: false
+
+  // Injected by BarWidget.qml. `bar` and `settings` come from the bar host,
+  // `anchorItem` is the button the panel hangs off, `hostWidget` is the widget
+  // the shell talks to.
+  property var anchorItem: null
+  property var hostWidget: null
 
   // ------------------------------------------------------------------ paths
 
@@ -29,6 +39,7 @@ Panel {
     return decodeURIComponent(url)
   }
   readonly property string cli: pluginDir + "/bin/agenttalk"
+  readonly property string home: Quickshell.env("HOME") || ""
 
   // ----------------------------------------------------------------- colors
 
@@ -38,6 +49,12 @@ Panel {
   readonly property color urgentColor: Color.urgent
   readonly property color selectedFill: Style.selectedFillFor(foreground, accent)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  // The theme's own state colours, resolved once: a hover that is a slightly
+  // different grey per widget is a hover that looks broken.
+  readonly property color hoverFill: Style.hoverFillFor(foreground, accent, urgentColor)
+  readonly property color pressedFill: Style.pressedFillFor(foreground, accent, urgentColor)
+  readonly property color normalFill: Style.normalFillFor(foreground, accent, urgentColor)
+  readonly property color hoverBorder: Style.hoverBorderFor(foreground, accent, urgentColor)
 
   // ------------------------------------------------------------------ state
 
@@ -46,6 +63,12 @@ Panel {
   property int cursorIndex: -1
   property bool cursorActive: false
   property string notice: ""
+  // Set while `opencode agent list` comes back empty. Stops the retry timer.
+  property bool agentsMissing: false
+  // The workspace path is edited in place, so the field only exists while the
+  // user is typing in it.
+  property bool workspaceEditing: false
+  property string workspaceDraft: ""
 
   // One Session per agent, all of them alive from the start: the bar icon has to
   // know whether anything is working even when this panel was never opened.
@@ -54,12 +77,21 @@ Panel {
 
   readonly property var selected: sessions[selectedId] !== undefined ? sessions[selectedId] : null
   readonly property var blocks: selected && selected.blocks ? selected.blocks : []
+  // Messages the transcript is too long to hold, so the count can be said out
+  // loud instead of pretending the conversation started here.
+  readonly property int dropped: selected ? selected.dropped : 0
   readonly property bool running: !!(selected && selected.running)
   readonly property bool anyRunning: {
     for (var id in sessions) if (sessions[id].running) return true
     return false
   }
   readonly property string workdir: selected ? selected.workdir : ""
+  readonly property bool workdirPinned: !!(selected && selected.workdirPinned)
+  // The directory a run would use right now: the one the user pinned, else
+  // whatever the panel setting forces, else the window they are on.
+  readonly property string effectiveWorkdir: configuredWorkDir !== ""
+    ? configuredWorkDir
+    : (workdirPinned ? workdir : "")
 
   readonly property bool autoApprove: setting("autoApprove", true) !== false
   readonly property string defaultAgent: String(setting("defaultAgent", ""))
@@ -91,9 +123,17 @@ Panel {
       next.push({id: String(entry.id), mode: String(entry.mode || "all")})
     }
     if (next.length === 0) {
-      notice = "No opencode agents found. Is opencode installed and on PATH?"
+      // opencode is the one dependency this plugin has, so say so plainly
+      // instead of showing an empty list. agentRetry keeps looking for it:
+      // installing opencode while the panel is open is a thing people do.
+      notice = "No opencode agents found. Install opencode, then reopen this panel."
+      agentsMissing = true
       return
     }
+    agentsMissing = false
+    // A stale "no agents" banner outlives the problem it described, so drop it
+    // as soon as opencode answers.
+    if (notice === "No opencode agents found. Install opencode, then reopen this panel.") notice = ""
 
     agents = next
 
@@ -101,19 +141,25 @@ Panel {
     var wanted = []
     for (var j = 0; j < next.length; j++) {
       var id = next[j].id
-      map[id] = sessions[id] !== undefined ? sessions[id] : createSession(id)
+      var existing = sessions[id]
+      if (existing === undefined || existing === null) existing = createSession(id)
+      map[id] = existing
       wanted.push(id)
     }
     sessions = map
     fire(["init"].concat(wanted))
 
-    if (selectedId === "" || map[selectedId] === undefined) selectedId = pickDefault()
+    if (map[selectedId] === undefined || selectedId === "") selectedId = pickDefault()
     cursorIndex = Math.max(0, indexOfAgent(selectedId))
   }
 
+  // opencode ships `build` as its general-purpose agent and marks the agents it
+  // can start with as primary. The configured default wins, then `build`, then
+  // the first primary, then whatever opencode listed first.
   function pickDefault() {
     if (defaultAgent !== "" && indexOfAgent(defaultAgent) >= 0) return defaultAgent
     for (var i = 0; i < agents.length; i++) if (agents[i].id === "build") return "build"
+    for (var j = 0; j < agents.length; j++) if (agents[j].mode === "primary") return agents[j].id
     return agents.length > 0 ? agents[0].id : ""
   }
 
@@ -124,12 +170,20 @@ Panel {
 
   function selectAgent(id) {
     if (!id || id === selectedId) return
+    // A half-typed path belongs to the agent it was typed for.
+    workspaceEditing = false
     selectedId = id
     markRead(id)
   }
 
+  // `createObject` is a QML-tooling helper that Quickshell does not provide,
+  // so the session component is compiled once here and instantiated from it.
+  readonly property var sessionComponent: Qt.createComponent(Qt.resolvedUrl("Session.qml"))
+
   function createSession(id) {
-    var session = createObject("Session.qml", root, {agentId: id})
+    if (!sessionComponent || sessionComponent.status !== Component.Ready) return null
+    var session = sessionComponent.createObject(root, {agentId: id})
+    if (!session) return null
     session.transcriptGrew.connect(function() { onTranscriptGrew(id) })
     return session
   }
@@ -176,12 +230,77 @@ Panel {
 
   function stopRun() {
     if (selectedId === "") return
-    report(["stop", selectedId])
+    var agent = selectedId
+    // Stopping is invisible by nature: the answer simply stops coming. Say so,
+    // or a working Stop button looks exactly like a broken one.
+    report(["stop", agent], function() { flash("stopped " + agent) })
   }
 
   function clearConversation() {
     if (selectedId === "") return
-    report(["clear", selectedId])
+    var agent = selectedId
+    report(["clear", agent], function() { flash("new conversation with " + agent) })
+  }
+
+  // ----------------------------------------------------------------- workspace
+  //
+  // The three ways to choose where the next run happens, all of them a single
+  // `agenttalk cd` away. The pin is the panel's own state, kept per agent in
+  // meta.json, so it survives a reload and a shell restart.
+
+  function setWorkspace(path) {
+    if (selectedId === "") return
+    var agent = selectedId
+    var target = String(path === undefined || path === null ? "" : path).trim()
+    workspaceEditing = false
+    if (target === "") return
+    // `agenttalk cd` resolves a relative path against its own working
+    // directory, which for a panel is wherever the shell happened to start.
+    // Someone typing a workspace into a panel means it from their home
+    // directory, so that is what gets sent.
+    var absolute = target === "~" ? home
+      : (target.indexOf("~/") === 0 ? home + target.substring(1)
+      : (target.indexOf("/") === 0 ? target
+      : home + "/" + target))
+    // The notice names the directory the script stored, not this guess at it.
+    report(["cd", agent, absolute], function(out) {
+      flash(agent + " will work in " + (out === "" ? absolute : out))
+    })
+  }
+
+  function useWindowWorkspace() {
+    if (selectedId === "") return
+    var agent = selectedId
+    report(["cd", agent, "--window"], function(out) {
+      flash(agent + " will work in " + (out === "" ? "the window you are on" : out))
+    })
+  }
+
+  function resetWorkspace() {
+    if (selectedId === "") return
+    var agent = selectedId
+    report(["cd", agent, "--reset"], function() { flash(agent + " uses the window you are on") })
+  }
+
+  function editWorkspace() {
+    if (selectedId === "") return
+    // Prefill with where the next run would go, so changing one segment of a
+    // long path does not mean typing the rest of it. The field is assigned as
+    // well as the draft: typing in it takes the text binding away for good, so
+    // the prefill has to be explicit or a second visit shows the last attempt.
+    workspaceDraft = effectiveWorkdir
+    workspaceField.text = workspaceDraft
+    workspaceEditing = true
+    // The field only exists after this state change, so the focus has to wait
+    // for the next frame, and the selection a frame after that: selectAll()
+    // asked for in the same tick as the focus lands on an empty selection,
+    // which left the caret at the start of the path. The prefill is absolute
+    // and people type `~/...` into it, so a caret in front of it means every
+    // keystroke splices a new path onto the old one instead of replacing it.
+    Qt.callLater(function() {
+      workspaceField.forceActiveFocus()
+      Qt.callLater(function() { workspaceField.selectAll() })
+    })
   }
 
   function flash(message) {
@@ -200,49 +319,94 @@ Panel {
 
   // The same, but a failure has to reach the user. An agent that silently
   // refuses to start is the worst outcome this panel has.
-  function report(args) {
+  function report(args, ok) {
     if (actionProcess.running) return
     actionProcess.command = [cli].concat(args)
+    actionProcess.onOk = ok
     actionProcess.running = true
+  }
+
+  // Quickshell's StdioCollector does not reliably emit streamFinished here, so
+  // nothing waits on that signal: every Process reads its collectors in
+  // onExited instead, one callLater tick after the process is gone so the
+  // collectors have been flushed. The collectors reset per run, so a reused
+  // Process never sees the previous run's bytes.
+  function collect(process, code, ok) {
+    Qt.callLater(function() {
+      var out = String(process.stdoutCollector.text || "").trim()
+      var err = String(process.stderrCollector.text || "").trim()
+      var message = out !== "" ? out : err
+      if (code !== 0) {
+        root.flash(message === "" ? ("agenttalk failed (" + code + ")") : message)
+        return
+      }
+      if (ok) ok(out)
+    })
+  }
+
+  // `done` and `tools` blocks carry no `text`, and QML warns when a Text gets
+  // undefined even while it is hidden, so every transcript line goes through
+  // this.
+  function blockText(block) {
+    if (!block || block.text === undefined || block.text === null) return ""
+    return String(block.text)
+  }
+
+  function parseAgentList(raw) {
+    try {
+      var parsed = JSON.parse(String(raw || ""))
+      return Array.isArray(parsed) ? parsed : []
+    } catch (e) {
+      return []
+    }
   }
 
   Process {
     id: agentsProcess
     command: [root.cli, "agents"]
     running: false
-    stdout: StdioCollector {
-      onStreamFinished: {
-        var parsed = []
-        try {
-          parsed = JSON.parse(text())
-        } catch (e) {
-          parsed = []
-        }
-        root.applyAgents(Array.isArray(parsed) ? parsed : [])
-      }
-    }
+    property var stdoutCollector: StdioCollector { waitForEnd: true }
+    property var stderrCollector: StdioCollector { waitForEnd: true }
+    stdout: stdoutCollector
+    stderr: stderrCollector
+    onExited: function(code) { root.collect(agentsProcess, code, function(out) { root.applyAgents(root.parseAgentList(out)) }) }
   }
 
   Process {
     id: fireProcess
     command: [root.cli]
     running: false
+    property var stdoutCollector: StdioCollector { waitForEnd: true }
+    property var stderrCollector: StdioCollector { waitForEnd: true }
+    stdout: stdoutCollector
+    stderr: stderrCollector
+    onExited: function(code) { root.collect(fireProcess, code, function() {}) }
   }
 
   Process {
     id: actionProcess
     command: [root.cli]
     running: false
-    stdout: StdioCollector {
-      onStreamFinished: {
-        if (exitCode === 0) return
-        var message = text().trim()
-        root.flash(message === "" ? ("agenttalk failed (" + exitCode + ")") : message)
-      }
+    property var stdoutCollector: StdioCollector { waitForEnd: true }
+    property var stderrCollector: StdioCollector { waitForEnd: true }
+    // Set per call by `report` and cleared here: a command that is dropped
+    // because another one is still going must not run its callback later.
+    property var onOk: null
+    stdout: stdoutCollector
+    stderr: stderrCollector
+    onExited: function(code) {
+      var ok = actionProcess.onOk
+      actionProcess.onOk = null
+      root.collect(actionProcess, code, function(out) {
+        // `run` detaches and prints its session id; that is progress, not a
+        // failure, and the transcript shows it anyway. Every other command is
+        // quiet on success, so anything it prints is worth surfacing.
+        if (out !== "" && actionProcess.subcommand !== "run") root.flash(out)
+        if (ok) ok(out)
+      })
     }
-    stderr: StdioCollector {
-      onStreamFinished: if (text().trim() !== "") root.flash(text().trim())
-    }
+    // command[0] is the script itself, so the subcommand sits at index 1.
+    property string subcommand: command.length > 1 ? command[1] : ""
   }
 
   Timer {
@@ -251,10 +415,86 @@ Panel {
     onTriggered: if (!agentsProcess.running) root.refreshAgents()
   }
 
+  // opencode is a separate program from the shell, so the first `agent list`
+  // can lose a race with a login, a mise activation or a slow disk. Keep asking
+  // for a couple of minutes, then stop: an open panel that polls a missing
+  // binary forever is worse than a notice the user can act on.
+  Timer {
+    id: agentRetry
+    interval: 5000
+    repeat: true
+    running: root.agentsMissing && agentRetry.tries < 24
+    property int tries: 0
+    onTriggered: {
+      tries++
+      if (!agentsProcess.running) root.refreshAgents()
+    }
+  }
+
   Timer {
     id: noticeTimer
     interval: 5000
     onTriggered: root.notice = ""
+  }
+
+  // Directory completion for the workspace field. QML asks the script instead
+  // of reading a directory itself: it never touches a file it did not create.
+  // The collector is read in onExited, per the house rule, and the field is
+  // refocused because the field is the panel's only target while editing.
+  Process {
+    id: completeProcess
+    command: [root.cli, "complete", ""]
+    running: false
+    property string base: ""
+    property var stdoutCollector: StdioCollector { waitForEnd: true }
+    property var stderrCollector: StdioCollector { waitForEnd: true }
+    stdout: stdoutCollector
+    stderr: stderrCollector
+
+    function complete(field) {
+      if (running) return
+      var value = field.text
+      var slash = value.lastIndexOf("/")
+      base = slash >= 0 ? value.slice(0, slash + 1) : ""
+      var stem = slash >= 0 ? value.slice(slash + 1) : value
+      completeProcess.command = [root.cli, "complete", base].concat(stem === "" ? [] : [stem])
+      running = true
+    }
+
+    onExited: function() {
+      // The collector's text is read a tick later, like every other process
+      // here: on exit it can still be one line short of what the run wrote.
+      var out = String(completeProcess.stdoutCollector.text || "")
+      var base = completeProcess.base
+      Qt.callLater(function() { applyCompletion(base, out) })
+    }
+  }
+
+  // One match fills the field, several share their common prefix, and nothing
+  // leaves the field alone. That is what a shell does too: type more to narrow
+  // the list rather than have a guess put in front of the user.
+  function applyCompletion(base, out) {
+    var names = out.trim().split("\n").filter(function(name) { return name !== "" })
+    if (names.length === 0) return
+    var stem = names.length === 1 ? names[0] : commonPrefix(names)
+    if (stem === "") return
+    workspaceDraft = base + stem + (names.length === 1 ? "/" : "")
+    workspaceField.text = workspaceDraft
+    workspaceField.cursorPosition = workspaceField.text.length
+    // The field is the panel's only focusable item while editing, and a
+    // Process run takes the panel's focus with it, so put it back.
+    workspaceField.forceActiveFocus()
+  }
+
+  function commonPrefix(names) {
+    var prefix = names[0]
+    for (var i = 1; i < names.length; i++) {
+      var name = names[i]
+      var shared = 0
+      while (shared < prefix.length && shared < name.length && prefix[shared] === name[shared]) shared++
+      prefix = prefix.slice(0, shared)
+    }
+    return prefix
   }
 
   // -------------------------------------------------------------- navigation
@@ -289,28 +529,34 @@ Panel {
     editor.forceActiveFocus()
   }
 
+  // Panel-to-panel tabbing has to start from the bar widget, not from this
+  // item: the bar knows which slot is on screen, and it holds the other
+  // panels' open state.
+  function switchPanel(direction) {
+    if (root.bar && typeof root.bar.switchPanelFrom === "function")
+      return root.bar.switchPanelFrom(root.hostWidget || root, direction)
+    return false
+  }
+
   // ------------------------------------------------------------------ chrome
 
-  BarIconButton {
-    id: button
-    anchors.fill: parent
-    bar: root.bar
-    // nf-md-robot: an agent, not a terminal.
-    text: "\uf06a9"
-    active: root.anyRunning
-    tooltipText: root.anyRunning
-      ? "AgentTalk — an agent is working"
-      : "AgentTalk — talk to your agents"
-    onPressed: function(b) { root.toggle() }
-  }
+  // Stop, New and the workspace actions are qs.Ui.Button, not hand-rolled
+  // Text + MouseArea pairs. The panel is keyboard-driven first: Button gives
+  // them a Tab stop and Enter/Space activation, and the theme's own pressed,
+  // hover and focus states, so a button cannot end up looking like a label
+  // that only some clicks reach.
 
   KeyboardPanel {
     id: panel
-    anchorItem: button
-    owner: root
+    anchorItem: root.anchorItem
+    owner: root.hostWidget || root
     bar: root.bar
     open: root.opened
-    focusTarget: keyCatcher
+    // The panel exists to be typed into, so the prompt takes the focus the
+    // shell hands the panel on open. Focusing the catcher instead left the
+    // prompt unfocused: the first characters went nowhere, Enter had nothing
+    // to send, and a panel that worked read as a panel that was dead.
+    focusTarget: editor
     contentWidth: panel.fittedContentWidth(Style.space(680))
     contentHeight: panel.fittedContentHeight(Style.space(440), Style.space(600))
 
@@ -318,8 +564,11 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
       // Typing belongs to the editor. The catcher drives the panel until the
-      // editor takes focus, then keeps its hands off.
-      blocked: editor.activeFocus
+      // editor takes focus, then keeps its hands off — which is where the
+      // prompt normally sits. The workspace field is a second place keys are
+      // meant to land: Enter there commits a path, and it must not reach
+      // send() as well.
+      blocked: editor.activeFocus || workspaceField.activeFocus
 
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
@@ -495,18 +744,14 @@ Panel {
                 elide: Text.ElideRight
               }
 
-              // Where the agent is about to work is the one thing you need to
-              // know before you press send, so it is always on screen.
               Text {
                 Layout.fillWidth: true
                 text: root.running
-                  ? "working in " + (root.workdir === "" ? "…" : root.workdir)
-                  : (root.configuredWorkDir !== ""
-                      ? root.configuredWorkDir
-                      : (root.workdir === ""
-                          ? "runs in the directory of the window you are on"
-                          : "last run: " + root.workdir))
-                color: root.dim
+                  ? "working" + (root.effectiveWorkdir === "" ? "" : " in " + root.effectiveWorkdir)
+                  : (root.dropped > 0
+                      ? root.dropped + " earlier message" + (root.dropped === 1 ? "" : "s") + " not shown"
+                      : "idle")
+                color: root.running ? root.accent : root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideLeft
@@ -514,17 +759,125 @@ Panel {
             }
 
             Button {
-              visible: root.running
               text: "Stop"
-              fontSize: Style.font.caption
+              focusable: true
+              foreground: root.urgentColor
+              visible: root.running
+              Layout.alignment: Qt.AlignVCenter
               onClicked: root.stopRun()
             }
 
             Button {
               text: "New"
-              tooltipText: "Forget this conversation"
-              fontSize: Style.font.caption
+              focusable: true
+              visible: root.selectedId !== ""
+              Layout.alignment: Qt.AlignVCenter
               onClicked: root.clearConversation()
+            }
+          }
+
+          // ------------------------------------------------------------ workspace
+          //
+          // Where the next run happens, and the only way to change it. It sits
+          // between the header and the transcript rather than in the header,
+          // because it is a path: a path needs room, and a header has none.
+          Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: Style.space(36)
+            color: root.normalFill
+            radius: Style.cornerRadius
+
+            RowLayout {
+              anchors.fill: parent
+              anchors.leftMargin: Style.spacing.sm
+              anchors.rightMargin: Style.spacing.xs
+              spacing: Style.spacing.xs
+
+              Text {
+                text: "WORKSPACE"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 0.6
+              }
+
+              // The path, or the reason there is not one. Read-only text that
+              // looks like text: clicking it turns it into the field below.
+              Text {
+                id: workspaceLabel
+                Layout.fillWidth: true
+                Layout.leftMargin: Style.spacing.xs
+                text: root.effectiveWorkdir !== ""
+                  ? root.effectiveWorkdir
+                  : "the directory of the window you are on"
+                color: root.effectiveWorkdir === "" ? root.dim : root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideLeft
+                visible: !root.workspaceEditing
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.IBeamCursor
+                  onClicked: root.editWorkspace()
+                }
+              }
+
+              TextField {
+                id: workspaceField
+                Layout.fillWidth: true
+                Layout.leftMargin: Style.spacing.xs
+                visible: root.workspaceEditing
+                text: root.workspaceDraft
+                selectByMouse: true
+                background: null
+                color: root.foreground
+                selectionColor: Style.selectionFillFor(root.foreground, root.accent)
+                selectedTextColor: root.foreground
+                placeholderText: "~/Code/AgentTalk"
+                placeholderTextColor: Qt.darker(root.foreground, 1.7)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+
+                onAccepted: root.setWorkspace(text)
+                Keys.onPressed: function(event) {
+                  if (event.key === Qt.Key_Escape) {
+                    root.workspaceEditing = false
+                    event.accepted = true
+                  } else if (event.key === Qt.Key_Tab) {
+                    // Tab completes a directory here. While the field holds
+                    // the focus the catcher never sees the key, so it cannot
+                    // fall through to switching panels.
+                    completeProcess.complete(workspaceField)
+                    event.accepted = true
+                  }
+                }
+              }
+
+              Button {
+                text: root.workspaceEditing ? "set" : "change…"
+                focusable: true
+                active: root.workspaceEditing
+                enabled: root.selectedId !== ""
+                onClicked: root.workspaceEditing ? root.setWorkspace(workspaceField.text) : root.editWorkspace()
+              }
+
+              Button {
+                text: "window"
+                focusable: true
+                enabled: root.selectedId !== "" && !root.workspaceEditing
+                active: !root.workdirPinned && !root.workspaceEditing
+                onClicked: root.useWindowWorkspace()
+              }
+
+              Button {
+                text: "reset"
+                focusable: true
+                enabled: root.workdirPinned && !root.workspaceEditing
+                onClicked: root.resetWorkspace()
+              }
             }
           }
 
@@ -560,21 +913,40 @@ Panel {
                   width: parent.width
                   spacing: Style.spacing.xs
 
-                  // what you said
+                  // what you said, in the directory you said it in
                   Rectangle {
                     visible: block.modelData.kind === "user"
-                    width: Math.min(parent.width, prompt.implicitWidth + Style.space(28))
-                    height: prompt.implicitHeight + Style.spacing.md
+                    width: Math.min(parent.width, Math.max(prompt.implicitWidth, stamp.implicitWidth) + Style.space(28))
+                    height: prompt.implicitHeight
+                      + (stamp.visible ? stamp.implicitHeight + Style.spacing.xs : 0)
+                      + Style.spacing.md
                     anchors.right: parent.right
                     color: root.selectedFill
                     radius: Style.cornerRadius
+
+                    // The workdir belongs to this question, not to the panel:
+                    // the workspace bar can have changed three times since.
+                    Text {
+                      id: stamp
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.top: parent.top
+                      anchors.margins: Style.spacing.sm
+                      visible: block.modelData.workdir !== undefined && block.modelData.workdir !== ""
+                      text: "in " + block.modelData.workdir
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideLeft
+                    }
 
                     Text {
                       id: prompt
                       anchors.left: parent.left
                       anchors.right: parent.right
+                      anchors.bottom: parent.bottom
                       anchors.margins: Style.spacing.sm
-                      text: block.modelData.text
+                      text: root.blockText(block.modelData)
                       textFormat: Text.PlainText
                       color: root.foreground
                       font.family: root.fontFamily
@@ -583,16 +955,28 @@ Panel {
                     }
                   }
 
-                  // what the agent said
-                  Text {
+                  // what the agent said, on a surface of its own: the quiet
+                  // side of the conversation against the user's bright one.
+                  Rectangle {
                     visible: block.modelData.kind === "text"
-                    width: parent.width
-                    text: block.modelData.text
-                    textFormat: Text.PlainText
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                    wrapMode: Text.Wrap
+                    width: Math.min(parent.width, answer.implicitWidth + Style.space(28))
+                    height: answer.implicitHeight + Style.spacing.md
+                    color: root.hoverFill
+                    radius: Style.cornerRadius
+
+                    Text {
+                      id: answer
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.top: parent.top
+                      anchors.margins: Style.spacing.sm
+                      text: root.blockText(block.modelData)
+                      textFormat: Text.PlainText
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      wrapMode: Text.Wrap
+                    }
                   }
 
                   // what the agent did
@@ -614,11 +998,24 @@ Panel {
                     }
                   }
 
+                  // how the run ended, when it did not end the way it should
+                  Text {
+                    visible: block.modelData.kind === "done" && block.modelData.code !== 0
+                    width: parent.width
+                    text: (block.modelData.code === 143 || block.modelData.code === 130)
+                      ? "· stopped"
+                      : "· the run ended with code " + block.modelData.code
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+
                   // what went wrong
                   Text {
                     visible: block.modelData.kind === "error"
                     width: parent.width
-                    text: "⚠  " + block.modelData.text
+                    text: "⚠  " + root.blockText(block.modelData)
                     textFormat: Text.PlainText
                     color: root.urgentColor
                     font.family: root.fontFamily
@@ -647,7 +1044,7 @@ Panel {
           }
 
           // input
-          Rectangle {
+          BorderSurface {
             Layout.fillWidth: true
             Layout.preferredHeight: Style.space(78)
             color: Style.controlFill(editor.activeFocus, false, root.foreground, root.accent)

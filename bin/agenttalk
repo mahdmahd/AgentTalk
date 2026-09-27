@@ -9,30 +9,39 @@
 #
 # One conversation per agent, stored as an append-only event log:
 #
-#   $STATE/agents/<agent>/meta.json     session id, workdir, pid, exit code
+#   $STATE/agents/<agent>/meta.json     session id, workdir, pid, exit code,
+#                                       and whether the workdir was chosen
 #   $STATE/agents/<agent>/events.jsonl  one normalized event per line
 #   $STATE/agents/<agent>/stderr.log    raw stderr of the last run
 #
 # Subcommands:
 #   agents                        list agents as JSON
-#   init <agent>                  make sure an agent's session files exist
+#   doctor                        report what this script can find (opencode, state)
+#   init <agent...>               make sure session files exist
 #   append <agent> <json>         append one event to an agent's log
 #   run <agent> <prompt>          start a turn (detached)
+#   cd <agent> <dir|--window|--reset>  choose where that agent works
+#   complete [dir-prefix] [stem]       list directories for Tab completion
 #   clear <agent>                 forget the conversation
 #   stop <agent>                  stop the running turn
 #   cwd                           working directory for the focused window
 #   state-dir                     print the state directory
+#   bind [combo]                  bind a key to open the panel (default: SUPER + A)
+#   unbind                        remove that keybinding again
 #
 # Environment:
 #   AGENTTALK_OPENCODE_BIN  opencode binary to use (default: opencode)
 #   AGENTTALK_STATE_DIR     state directory override
 #   AGENTTALK_TIMEOUT       seconds before a run is killed (default: 3600)
+#   HYPRLAND_CONFIG_DIR    Hyprland config directory (default: ~/.config/hypr)
 
 set -uo pipefail
 
+PLUGIN_ID="io.github.ramackersjp.agenttalk"
 STATE_DIR="${AGENTTALK_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agenttalk}"
 OPENCODE_BIN="${AGENTTALK_OPENCODE_BIN:-opencode}"
 RUN_TIMEOUT="${AGENTTALK_TIMEOUT:-3600}"
+HYPR_DIR="${HYPRLAND_CONFIG_DIR:-$HOME/.config/hypr}"
 
 log() { printf 'agenttalk: %s\n' "$*" >&2; }
 
@@ -45,6 +54,28 @@ agent_dir() {
   printf '%s/agents/%s' "$STATE_DIR" "$id"
 }
 
+# `~` and a relative path are typed by humans; the panel and the event log want
+# one absolute directory that means the same thing tomorrow.
+expand_path() {
+  local path="${1:-}"
+  [[ -z "$path" ]] && return 1
+  case "$path" in
+    "~") path="$HOME" ;;
+    "~/"*) path="$HOME/${path#\~/}" ;;
+  esac
+  [[ "$path" != /* ]] && path="$PWD/$path"
+  readlink -f "$path" 2>/dev/null || printf '%s' "$path"
+}
+
+# The directory the user picked in the panel, if they picked one. A run falls
+# back to this before it falls back to the focused window, so the workspace
+# survives closing the panel.
+pinned_workdir() {
+  local dir="$1"
+  [[ -f "$dir/meta.json" ]] || return 0
+  jq -r 'select(.workdirPinned == true) | .workdir // empty' "$dir/meta.json" 2>/dev/null
+}
+
 read_pid() {
   local dir="$1"
   [[ -f "$dir/meta.json" ]] || return 0
@@ -53,14 +84,62 @@ read_pid() {
 
 # ---------------------------------------------------------------- agents
 
+# opencode gets installed in several ways (mise, a system package, the install
+# script), and the shell that runs this plugin does not necessarily carry the
+# PATH a terminal has. PATH answers first; the places opencode actually lands
+# answer the rest, so "no agents" means "no opencode" and not "odd PATH".
+RESOLVED_OPENCODE=""
+
+resolve_opencode() {
+  [[ -n "$RESOLVED_OPENCODE" ]] && return 0
+
+  if command -v "$OPENCODE_BIN" >/dev/null 2>&1; then
+    RESOLVED_OPENCODE=$(command -v "$OPENCODE_BIN")
+    return 0
+  fi
+
+  # An explicit path was given: honour it or fail, never go looking elsewhere.
+  if [[ "$OPENCODE_BIN" == */* ]]; then
+    [[ -x "$OPENCODE_BIN" ]] && RESOLVED_OPENCODE="$OPENCODE_BIN"
+    [[ -n "$RESOLVED_OPENCODE" ]]
+    return $?
+  fi
+
+  local candidate
+  for candidate in \
+    "$HOME/.local/bin/$OPENCODE_BIN" \
+    "$HOME/.opencode/bin/$OPENCODE_BIN" \
+    "$HOME/.local/share/mise/shims/$OPENCODE_BIN" \
+    "/usr/local/bin/$OPENCODE_BIN" \
+    "/usr/bin/$OPENCODE_BIN"; do
+    if [[ -x "$candidate" ]]; then
+      RESOLVED_OPENCODE="$candidate"
+      return 0
+    fi
+  done
+
+  # mise keeps one directory per installed version; the glob is sorted, so the
+  # last match is the newest install.
+  local found=()
+  for candidate in "$HOME"/.local/share/mise/installs/"$OPENCODE_BIN"/*/"$OPENCODE_BIN"; do
+    [[ -x "$candidate" ]] && found+=("$candidate")
+  done
+  if [[ ${#found[@]} -gt 0 ]]; then
+    RESOLVED_OPENCODE="${found[-1]}"
+    return 0
+  fi
+
+  return 1
+}
+
 cmd_agents() {
-  if ! command -v "$OPENCODE_BIN" >/dev/null 2>&1; then
+  if ! resolve_opencode; then
     echo '[]'
     return 0
   fi
 
   local list
-  list=$("$OPENCODE_BIN" agent list 2>/dev/null)
+  list=$("$RESOLVED_OPENCODE" agent list 2>/dev/null)
   [[ -n "$list" ]] || { echo '[]'; return 0; }
 
   local first=1
@@ -89,6 +168,47 @@ cmd_agents() {
     jq -nc --arg id "$id" --arg mode "$mode" '{id: $id, mode: $mode}'
   done <<<"$list"
   printf ']\n'
+}
+
+# ---------------------------------------------------------------- doctor
+
+# What the panel would see if it asked right now. The panel has no way to show a
+# stack trace, so this is the command that answers "why is the agent list
+# empty?" without reading the shell's log.
+cmd_doctor() {
+  local found="false" path="" version="" agents="0" writable="false"
+  if resolve_opencode; then
+    found="true"
+    path="$RESOLVED_OPENCODE"
+    version=$("$RESOLVED_OPENCODE" --version 2>/dev/null | head -1)
+    agents=$(cmd_agents | jq 'length' 2>/dev/null || echo 0)
+  fi
+
+  if mkdir -p "$STATE_DIR" 2>/dev/null && [[ -w "$STATE_DIR" ]]; then
+    writable="true"
+  fi
+
+  jq -nc \
+    --argjson found "$([[ "$found" == "true" ]] && echo true || echo false)" \
+    --arg requested "$OPENCODE_BIN" \
+    --arg path "$path" \
+    --arg version "$version" \
+    --argjson agents "${agents:-0}" \
+    --arg stateDir "$STATE_DIR" \
+    --argjson writable "$([[ "$writable" == "true" ]] && echo true || echo false)" \
+    --argjson onPath "$(command -v "$OPENCODE_BIN" >/dev/null 2>&1 && echo true || echo false)" \
+    '{
+       opencode: {
+         requested: $requested,
+         found: $found,
+         onPath: $onPath,
+         path: $path,
+         version: $version
+       },
+       agents: $agents,
+       stateDir: $stateDir,
+       stateDirWritable: $writable
+     }'
 }
 
 # ---------------------------------------------------------------- append
@@ -124,19 +244,235 @@ cmd_cwd() {
   fi
 }
 
+# ---------------------------------------------------------------------- cd
+#
+# `cd` is the workspace switch: a directory the user picked, kept in meta.json
+# so the panel can show it after a reload and the next run can use it without
+# being told. --window follows the focused window, --reset forgets the choice.
+cmd_cd() {
+  local agent="${1:-}" target="${2:-}"
+  local dir pinned resolved=""
+  dir=$(agent_dir "$agent") || return 1
+  [[ -f "$dir/meta.json" ]] || cmd_init "$agent" >/dev/null || return 1
+
+  case "$target" in
+    "")
+      log "cd needs a directory, --window or --reset"
+      return 1
+      ;;
+    --reset)
+      pinned="false"
+      ;;
+    --window)
+      pinned="true"
+      resolved=$(cmd_cwd)
+      ;;
+    *)
+      pinned="true"
+      resolved=$(expand_path "$target")
+      [[ -d "$resolved" ]] || { log "no such directory: $target"; return 1; }
+      ;;
+  esac
+
+  jq -c --argjson pinned "$pinned" --arg workdir "$resolved" \
+    '.workdirPinned = $pinned | .workdir = $workdir' \
+    "$dir/meta.json" >"$dir/meta.json.new" || return 1
+  mv "$dir/meta.json.new" "$dir/meta.json"
+  printf '%s\n' "$resolved"
+}
+
+# ---------------------------------------------------------------- complete
+#
+# Directory completion for the panel's workspace field: `agenttalk complete
+# [dir-prefix] [stem]` prints the directories under dir-prefix that start with
+# stem, one per line, and nothing at all when there is no match. It is a
+# subcommand rather than a QML directory read because the panel never touches a
+# file it did not create, and because the same logic belongs in a shell
+# completion function where it can be reused.
+cmd_complete() {
+  local prefix="${1:-}" stem="${2:-}"
+  local dir
+  # An empty prefix is the empty field, which means "from the top": $HOME, the
+  # same place a bare ~ in the field would start from.
+  if [[ -z "$prefix" ]]; then
+    dir="$HOME"
+  else
+    dir=$(expand_path "$prefix") || return 0
+  fi
+  # A prefix that names a file, or names nothing, simply has no completions.
+  # `find` walks one level without a shell glob, so a name with a space or a
+  # bracket in it still completes instead of erroring out, and it never follows
+  # a symlink into somewhere the user did not ask about.
+  [[ -d "$dir" ]] || return 0
+  find "$dir/" -mindepth 1 -maxdepth 1 -type d -name "${stem}*" -printf '%f\n' 2>/dev/null | LC_ALL=C sort
+}
+
 # ------------------------------------------------------------------- init
 
-# Make sure an agent has a session directory with the two files the panel
+# The one place a fresh meta.json is written. `init` and `clear` both used to
+# spell this object out themselves, and `clear` kept the older spelling, so a
+# cleared conversation came back without its workspace keys at all.
+write_meta() {
+  local dir="${1:-}" agent="${2:-}" workdir="${3:-}" pinned="${4:-false}"
+  [[ "$pinned" == "true" ]] || pinned="false"
+  jq -nc --arg agent "$agent" --arg workdir "$workdir" --argjson pinned "$pinned" \
+    '{agent: $agent, sessionID: "", workdir: $workdir, workdirPinned: $pinned, running: false, pid: 0, exitCode: null}' \
+    >"$dir/meta.json"
+}
+
+# Make sure agents have a session directory with the two files the panel
 # watches, so a FileView never has to watch something that does not exist.
 cmd_init() {
-  local dir
-  dir=$(agent_dir "${1:-}") || return 1
-  mkdir -p "$dir" || return 1
+  local id dir
+  for id in "$@"; do
+    dir=$(agent_dir "$id") || return 1
+    mkdir -p "$dir" || return 1
   [[ -f "$dir/events.jsonl" ]] || : >"$dir/events.jsonl"
-  [[ -f "$dir/meta.json" ]] && return 0
-  jq -nc --arg agent "${1:-}" \
-    '{agent: $agent, sessionID: "", workdir: "", running: false, pid: 0, exitCode: null}' \
-    >"$dir/meta.json"
+  [[ -f "$dir/meta.json" ]] && continue
+  write_meta "$dir" "$id"
+done
+}
+
+# -------------------------------------------------------------- keybinding
+#
+# The panel is a bar button, and a bar button you have to aim at is a bar button
+# you stop using. These two subcommands keep one small managed block in
+# ~/.config/hypr/bindings.lua, so installing the binding is one command and
+# changing it later is one more. The block is marked the same way the other
+# plugins on this machine mark theirs, so it is obvious what is ours and easy to
+# remove by hand.
+
+BINDINGS_FILE="$HYPR_DIR/bindings.lua"
+BIND_START="-- >>> agenttalk (managed by bin/agenttalk)"
+BIND_END="-- <<< agenttalk"
+BIND_DEFAULT_COMBO="SUPER + A"
+BIND_DEFAULT_KEY="A"
+
+# Omarchy's o.bind takes the whole combo as one string, the way its own
+# bindings.lua does, so the only work here is getting the words the user typed
+# into that shape: "SUPER CTRL A", "SUPER + A" and "SUPER+A" are one binding.
+# A lone modifier is worth accepting because it is the common "I only care about
+# the modifier" case, and A is the key this plugin has always used.
+normalize_combo() {
+  local raw="" word
+  for word in "$@"; do
+    raw+="${raw:+ }${word//+/ }"
+  done
+  # shellcheck disable=SC2086
+  set -- $raw
+  if [[ $# -eq 0 ]]; then
+    BIND_COMBO="$BIND_DEFAULT_COMBO"
+    return 0
+  fi
+  if [[ $# -eq 1 ]]; then
+    set -- "${1^^}" "$BIND_DEFAULT_KEY"
+  fi
+  local out="" sep="" word
+  for word in "$@"; do
+    out+="$sep${word^^}"
+    sep=" + "
+  done
+  BIND_COMBO="$out"
+}
+
+bind_block() {
+  cat <<LUA
+$BIND_START
+-- Opens the AgentTalk panel. Remove this block, or run: agenttalk unbind
+hl.unbind("$BIND_COMBO")
+o.bind("$BIND_COMBO", "AgentTalk", "omarchy-shell shell toggle $PLUGIN_ID")
+$BIND_END
+LUA
+}
+
+cmd_bind() {
+  local print_only="false"
+  if [[ "${1:-}" == "--print" ]]; then
+    shift
+    print_only="true"
+  fi
+
+  BIND_COMBO=""
+  normalize_combo "$@"
+  local combo="$BIND_COMBO"
+
+  if [[ "$print_only" == "true" ]]; then
+    bind_block
+    return 0
+  fi
+
+  if [[ ! -f "$BINDINGS_FILE" ]]; then
+    log "no $BINDINGS_FILE; add this by hand:"
+    bind_block >&2
+    return 1
+  fi
+
+  local tmp
+  tmp=$(mktemp) || return 1
+  if grep -qF -- "$BIND_START" "$BINDINGS_FILE"; then
+    # Replace the block we own, leave everything else exactly as it was.
+    awk -v start="$BIND_START" -v end="$BIND_END" '
+      $0 == start { skip = 1 }
+      skip != 1 { print }
+      $0 == end { skip = 0 }
+    ' "$BINDINGS_FILE" >"$tmp"
+  else
+    cat "$BINDINGS_FILE" >"$tmp"
+  fi
+
+  # One trailing newline, then our block: end of file is the easiest place for a
+  # reader to find it.
+  if [[ -s "$tmp" ]]; then printf '\n' >>"$tmp"; fi
+  bind_block >>"$tmp"
+  cat "$tmp" >"$BINDINGS_FILE"
+  rm -f "$tmp"
+
+  if command -v hyprctl >/dev/null 2>&1; then
+    hyprctl reload >/dev/null 2>&1
+  fi
+  echo "bound $combo to AgentTalk (see $BINDINGS_FILE)"
+}
+
+cmd_unbind() {
+  if [[ ! -f "$BINDINGS_FILE" ]]; then
+    echo "nothing to remove"
+    return 0
+  fi
+  if ! grep -qF -- "$BIND_START" "$BINDINGS_FILE"; then
+    echo "no agenttalk keybinding found"
+    return 0
+  fi
+
+  local tmp combo
+  tmp=$(mktemp) || return 1
+  # Read the combo out of our own block, not the first hl.unbind in the file:
+  # the point is to tell the user which key just went free.
+  combo=$(awk -v start="$BIND_START" -v end="$BIND_END" '
+    $0 == start { inblock = 1; next }
+    $0 == end { inblock = 0 }
+    inblock && match($0, /hl\.unbind\("[^"]*"\)/) {
+      print substr($0, RSTART + 11, RLENGTH - 13)
+    }
+  ' "$BINDINGS_FILE" | head -1)
+  awk -v start="$BIND_START" -v end="$BIND_END" '
+    $0 == start { skip = 1 }
+    skip != 1 { print }
+    $0 == end { skip = 0 }
+  ' "$BINDINGS_FILE" >"$tmp"
+  # Squeeze the blank line our block left behind, so repeated bind/unbind
+  # cycles do not slowly pad the end of somebody's config.
+  sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$tmp"
+  cat "$tmp" >"$BINDINGS_FILE"
+  rm -f "$tmp"
+
+  if command -v hyprctl >/dev/null 2>&1; then
+    hyprctl reload >/dev/null 2>&1
+  fi
+  if [[ -n "$combo" ]]; then
+    echo "removed the agenttalk binding on $combo"
+  else
+    echo "removed the agenttalk binding"
+  fi
 }
 
 # ------------------------------------------------------------------ clear
@@ -150,10 +486,19 @@ cmd_clear() {
     kill -TERM -- "-$pid" 2>/dev/null
     sleep 0.3
   fi
+  # The workspace is not part of the conversation, so it survives a clear: a
+  # user who pinned a directory did that on purpose, and "forget the
+  # conversation" is not "forget where you were working". The pin has its own
+  # reset (`cd --reset`, the panel's reset button).
+  local workdir="" pinned=false
+  if [[ -f "$dir/meta.json" ]]; then
+    workdir=$(jq -r '.workdir // ""' "$dir/meta.json" 2>/dev/null)
+    pinned=$(jq -r '.workdirPinned // false' "$dir/meta.json" 2>/dev/null)
+  fi
   rm -f "$dir/events.jsonl" "$dir/meta.json" "$dir/stderr.log"
   mkdir -p "$dir"
   : >"$dir/events.jsonl"
-  jq -nc --arg agent "${1:-}" '{agent: $agent, sessionID: "", running: false, pid: 0}' >"$dir/meta.json"
+  write_meta "$dir" "${1:-}" "$workdir" "$pinned"
 }
 
 # ------------------------------------------------------------------- stop
@@ -231,6 +576,17 @@ worker() {
   mkdir -p "$dir"
   touch "$events"
 
+  # The worker is its own process, so it resolves opencode for itself: the
+  # session it was spawned from may have been started from a different PATH.
+  if ! resolve_opencode; then
+    jq -nc --arg t "$OPENCODE_BIN not found" '{t: "error", text: $t}' >>"$events"
+    jq -nc '{t: "done", code: 127}' >>"$events"
+    jq -nc --arg agent "$agent" \
+      '{agent: $agent, sessionID: "", workdir: "", workdirPinned: false, running: false, pid: 0, exitCode: 127}' \
+      >"$meta"
+    return 127
+  fi
+
   # `finalize` may run from a signal handler as well as from the happy path, so
   # it takes a lock rather than trusting to be called once. `run` clears the
   # lock before it spawns the next worker.
@@ -265,12 +621,27 @@ worker() {
   prompt=$(cat "$prompt_file" 2>/dev/null)
   rm -f "$prompt_file"
 
+  # Your own words go into the log before the agent answers, so reopening the
+  # panel later shows the question next to the answer. opencode's stream never
+  # repeats the prompt. The workdir travels with it: a transcript read days
+  # later has to say which tree each question was asked in, because the panel's
+  # header only ever shows the current one.
+  jq -nc --arg text "$prompt" --arg workdir "$workdir" \
+    '{t: "user", text: $text, workdir: $workdir}' >>"$events"
+
+  # The workdir the user picked in the panel outlives this run, so it is read
+  # before meta.json is rebuilt rather than after.
+  local pinned="false"
+  [[ -f "$meta" ]] && pinned=$(jq -r '.workdirPinned // false' "$meta" 2>/dev/null || echo false)
+
   local current=""
   current=$(jq -c --arg agent "$agent" --arg workdir "$workdir" --arg session "$session_id" \
+    --argjson pinned "$pinned" \
     '{
        agent: $agent,
        sessionID: $session,
        workdir: $workdir,
+       workdirPinned: $pinned,
        running: true,
        pid: 0,
        startedAt: now,
@@ -291,7 +662,7 @@ worker() {
   (
     cd "$workdir" || exit 1
     printf '%s\n' "$BASHPID" >"$dir/run.pid"
-    exec timeout --kill-after=10 "$RUN_TIMEOUT" "$OPENCODE_BIN" "${args[@]}" "$prompt"
+    exec timeout --kill-after=10 "$RUN_TIMEOUT" "$RESOLVED_OPENCODE" "${args[@]}" "$prompt"
   ) 2>"$dir/stderr.log" </dev/null \
     | normalize_stream \
     | while IFS= read -r event; do
@@ -330,11 +701,18 @@ cmd_run() {
   [[ -n "$agent" ]] || { log "run needs an agent id"; return 1; }
   [[ -n "${prompt//[[:space:]]/}" ]] || { log "run needs a prompt"; return 1; }
 
-  if ! command -v "$OPENCODE_BIN" >/dev/null 2>&1; then
-    log "$OPENCODE_BIN is not on PATH"
+  if ! resolve_opencode; then
+    log "$OPENCODE_BIN not found; install opencode or set AGENTTALK_OPENCODE_BIN"
     return 127
   fi
 
+  # No --dir means: the directory the user picked for this agent, then the
+  # directory of the window they are looking at.
+  if [[ -z "$workdir" ]]; then
+    local dir_probe
+    dir_probe=$(agent_dir "$agent") || return 1
+    workdir=$(pinned_workdir "$dir_probe")
+  fi
   [[ -d "$workdir" ]] || workdir=$(cmd_cwd)
   [[ -d "$workdir" ]] || workdir="$HOME"
 
@@ -360,9 +738,13 @@ cmd_run() {
   prompt_file=$(mktemp "$dir/prompt.XXXXXX") || return 1
   printf '%s' "$prompt" >"$prompt_file"
 
+  # A worker that dies before opencode starts has no transcript to explain it,
+  # so its own stderr gets a file of its own. Empty means the run went normal.
+  : >"$dir/worker.log"
+
   local self="$0"
   setsid nohup "$self" --worker "$agent" "$prompt_file" "$workdir" "$auto" "$fresh" \
-    >/dev/null 2>&1 </dev/null &
+    >/dev/null 2>>"$dir/worker.log" </dev/null &
   disown 2>/dev/null || true
 }
 
@@ -370,19 +752,26 @@ cmd_run() {
 
 case "${1:-}" in
   agents) shift; cmd_agents "$@" ;;
-  init) shift; cmd_init "${1:-}" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  init) shift; cmd_init "$@" ;;
   append) shift; cmd_append "$@" ;;
   run) shift; cmd_run "$@" ;;
   clear) shift; cmd_clear "${1:-}" ;;
   stop) shift; cmd_stop "${1:-}" ;;
   cwd) shift; cmd_cwd "$@" ;;
+  cd) shift; cmd_cd "$@" ;;
+  complete) shift; cmd_complete "$@" ;;
   state-dir) printf '%s\n' "$STATE_DIR" ;;
+  bind) shift; cmd_bind "$@" ;;
+  unbind) shift; cmd_unbind "$@" ;;
   --worker)
     shift
     worker "$@"
     ;;
   *)
-    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+    # The header comment is the manual: print every line of it, whatever its
+    # length, rather than a line range that goes stale on the next edit.
+    awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
     exit 1
     ;;
 esac
