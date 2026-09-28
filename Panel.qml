@@ -1161,8 +1161,14 @@ Panel {
               visible: root.workspaceEditing && (root.suggestPaths.length > 0 || root.suggestSaid === "none")
               anchors.top: workspaceRow.bottom
               anchors.topMargin: Style.spacing.xs
-              anchors.left: workspaceField.left
-              anchors.right: workspaceField.right
+              // Anchored to the row, not to the field: the field's parent is
+              // the row, so its left and right are not this box's coordinates,
+              // and anchoring to them gives a box no width at all. The row is
+              // this box's own parent, so it spans the panel under the field.
+              anchors.left: workspaceRow.left
+              anchors.leftMargin: Style.spacing.sm
+              anchors.right: workspaceRow.right
+              anchors.rightMargin: Style.spacing.xs
               // Long enough for the choices, short enough that a big directory
               // cannot push the field off the panel. Clamped here rather than
               // on the list, which has no such property: the list fills the box
@@ -1225,10 +1231,10 @@ Panel {
               visible: root.workspaceEditing && root.suggestPaths.length === 0 && root.suggestSaid === "none"
               anchors.top: workspaceRow.bottom
               anchors.topMargin: Style.spacing.xs
-              anchors.left: workspaceField.left
-              anchors.leftMargin: Style.spacing.sm
-              anchors.right: workspaceField.right
-              anchors.rightMargin: Style.spacing.sm
+              anchors.left: workspaceRow.left
+              anchors.leftMargin: Style.spacing.sm * 2
+              anchors.right: workspaceRow.right
+              anchors.rightMargin: Style.spacing.xs * 2
               height: Style.space(26)
               verticalAlignment: Text.AlignVCenter
               text: "no directory here matches"
