@@ -63,12 +63,19 @@ Item {
     transcriptGrew()
   }
 
+  // `loaded` is emitted once, when the file is read for the first time. On its
+  // own that makes the panel read these two files exactly once, when it opens:
+  // a run that starts, a path that gets pinned and every new event would
+  // arrive after that and never be seen until the panel was reopened.
+  // `fileChanged` is the only signal that fires afterwards, and `text()` hands
+  // back the copy it already has until `reload()` goes and reads the new one.
   FileView {
     path: root.valid ? root.dir + "/meta.json" : ""
     watchChanges: true
     printErrors: false
     onLoaded: root.loadMeta(text())
     onLoadFailed: root.loadMeta("{}")
+    onFileChanged: reload()
   }
 
   FileView {
@@ -77,5 +84,6 @@ Item {
     printErrors: false
     onLoaded: root.loadEvents(text())
     onLoadFailed: root.loadEvents("")
+    onFileChanged: reload()
   }
 }

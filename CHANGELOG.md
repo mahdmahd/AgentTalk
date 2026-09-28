@@ -35,6 +35,20 @@ the only place a version number lives.
 
 ### Fixed
 
+- The panel now follows what it is supposed to follow. `meta.json` and
+  `events.jsonl` were read once, when the panel opened, and never again: a
+  `FileView` emits `loaded` when it reads a file and `fileChanged` when the
+  file changes afterwards, and only the first one was handled. So a run that
+  started, a path that was pinned and every new event in the transcript
+  arrived after the panel was already open and stayed invisible until it was
+  reopened, and `New` and `reset` looked broken because they could not change a
+  transcript the panel had stopped reading. Both views reload on `fileChanged`.
+- A button that cannot do anything says so. `reset` needs a pinned workspace
+  and `change…`/`window` need a selected agent, but the shell's `Button` draws
+  no disabled state at all, so those actions looked exactly as live as `New`
+  and pressing them did nothing at all. They are dimmed while disabled, and the
+  path in the `WORKSPACE` row now says that clicking it is what pins a path,
+  which is what gives `reset` something to do.
 - `agenttalk clear` no longer drops the pinned workspace. It wrote an older
   `meta.json` that had no `workdir` or `workdirPinned`, so forgetting a
   conversation silently forgot where you were working too, and the panel went

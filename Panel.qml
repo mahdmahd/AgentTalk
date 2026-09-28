@@ -55,6 +55,11 @@ Panel {
   readonly property color pressedFill: Style.pressedFillFor(foreground, accent, urgentColor)
   readonly property color normalFill: Style.normalFillFor(foreground, accent, urgentColor)
   readonly property color hoverBorder: Style.hoverBorderFor(foreground, accent, urgentColor)
+  // `qs.Ui.Button` draws no disabled state: not a dimmer label, not a muted
+  // border, not a different cursor. A button that cannot do anything is
+  // painted exactly like one that can, so an action that is merely not
+  // applicable yet reads as a broken panel. Dimming is the whole fix.
+  readonly property real disabledDim: 0.4
 
   // ------------------------------------------------------------------ state
 
@@ -808,9 +813,16 @@ Panel {
                 id: workspaceLabel
                 Layout.fillWidth: true
                 Layout.leftMargin: Style.spacing.xs
-                text: root.effectiveWorkdir !== ""
-                  ? root.effectiveWorkdir
-                  : "the directory of the window you are on"
+                // Pinning a path is also the only thing that gives `reset`
+                // anything to do, and a dimmed button on its own says no more
+                // than a dead one did. So the row that owns the pin says what a
+                // click on it is for, right where the user is already looking.
+                text: {
+                  var where = root.effectiveWorkdir !== ""
+                    ? root.effectiveWorkdir
+                    : "the directory of the window you are on"
+                  return root.workdirPinned ? where : where + "  ·  click to pin a path"
+                }
                 color: root.effectiveWorkdir === "" ? root.dim : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -861,6 +873,7 @@ Panel {
                 focusable: true
                 active: root.workspaceEditing
                 enabled: root.selectedId !== ""
+                opacity: enabled ? 1 : root.disabledDim
                 onClicked: root.workspaceEditing ? root.setWorkspace(workspaceField.text) : root.editWorkspace()
               }
 
@@ -869,6 +882,7 @@ Panel {
                 focusable: true
                 enabled: root.selectedId !== "" && !root.workspaceEditing
                 active: !root.workdirPinned && !root.workspaceEditing
+                opacity: enabled ? 1 : root.disabledDim
                 onClicked: root.useWindowWorkspace()
               }
 
@@ -876,6 +890,7 @@ Panel {
                 text: "reset"
                 focusable: true
                 enabled: root.workdirPinned && !root.workspaceEditing
+                opacity: enabled ? 1 : root.disabledDim
                 onClicked: root.resetWorkspace()
               }
             }
