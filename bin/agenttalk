@@ -302,8 +302,32 @@ cmd_cd() {
 cmd_complete() {
   local prefix="${1:-}" stem="${2:-}"
   local dir
+  # A stem that holds a slash is part of the path, not a name. The panel splits
+  # the field at its last slash, so it sends `Code/A` as a prefix and a stem,
+  # while a person at a terminal types it as one string; folding the two back
+  # together means both spellings complete the same, instead of the second one
+  # matching nothing and looking like a directory that is not there.
+  if [[ "$stem" == */* ]]; then
+    prefix="$prefix$stem"
+    # Split back at the last slash, so the new prefix is the directory and the
+    # new stem is the name being typed. A trailing slash leaves the stem empty,
+    # which is the question "what is inside this directory".
+    stem="${prefix##*/}"
+    prefix="${prefix%/*}/"
+  fi
+  # A path that does not start at the root is one the user means from their home
+  # directory, which is what the panel sends too, so both agree on where a bare
+  # name lives. `expand_path` would resolve it against whatever directory the
+  # script happens to be started in, which for a panel is wherever the shell was.
+  if [[ "$prefix" != /* && "$prefix" != "~"* ]]; then
+    prefix="$HOME/$prefix"
+  fi
   # An empty prefix is the empty field, which means "from the top": $HOME, the
-  # same place a bare ~ in the field would start from.
+  # same place a bare ~ in the field would start from. A trailing slash on the
+  # prefix is the question "what is inside this directory", and leaves the stem
+  # empty: that is how Tab after a unique match keeps the list useful, instead
+  # of emptying itself one keypress after it was right and leaving the field
+  # claiming a directory does not exist while standing in it.
   if [[ -z "$prefix" ]]; then
     dir="$HOME"
   else

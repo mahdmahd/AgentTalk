@@ -18,6 +18,14 @@ the only place a version number lives.
 - Dot directories are offered once you type a leading dot, the way a shell
   treats them. They used to turn up in every list, where one of them shifts the
   common prefix of everything behind it.
+- The path in the field follows the row you walk to, and a row can be clicked.
+  The text and the lit row are one choice shown twice, so scrolling the list and
+  watching the field change is what makes them the same control instead of two
+  that have to be kept in agreement.
+- A path the script refuses comes back into the field that asked for it: the
+  text you typed stays, and the reason sits under it. It used to arrive as a
+  banner, five seconds after the field had closed — about a path you could no
+  longer see, and which you then had to type again to find out why.
 
 ### Changed
 
@@ -25,11 +33,14 @@ the only place a version number lives.
   there is no case-sensitivity muscle memory to lean on, and `agent` used to
   find nothing where `AgentTalk` was sitting right there — in silence, which is
   the most expensive kind of wrong answer in a field.
-- Enter takes the match when the text as typed is not a directory itself: the
-  path typed, else the chosen row, else the only match. A path that resolves to
-  nothing is no longer sent to `agenttalk cd` at all, so the field says `no
-  directory here matches` under itself and stays open, instead of the panel
-  answering a question nobody asked with a banner about a missing directory.
+- Enter asks the script instead of deciding. The list says what exists that
+  starts with what you typed, which is a different question from "is this a
+  directory", and a field that answers the second one itself is wrong the moment
+  the two disagree. Enter takes the lit row where the list names the text, and
+  sends the path as typed where it does not; `agenttalk cd` has the last word.
+- Completion reads a slash in the stem as a path rather than as part of a name.
+  Tab puts a trailing slash on after a unique match, and a stem that cannot match
+  anything is silence where the directory is sitting right there.
 - `agenttalk cd` says `not a directory` when the path is a file, rather than
   claiming a directory does not exist when it is visibly right there.
 
@@ -40,6 +51,13 @@ the only place a version number lives.
   answer that came back after more was typed replaced the text with a path built
   from the text as it was when the question was asked — both ending in a path
   that does not exist.
+- Typing a directory's own name and pressing Tab no longer claims that directory
+  does not exist. The trailing slash emptied the list, the empty list read as
+  `no directory here matches`, and Enter then refused to send the path it had
+  just finished recognising. The empty list now says `nothing here starts with
+  that`, which is a statement about the list rather than a verdict on the path,
+  and a trailing slash asks what is inside the directory instead of matching
+  nothing.
 
 **1.2.0**
 

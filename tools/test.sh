@@ -191,12 +191,13 @@ check "cd fails for an agent that does not exist" \
 # `complete` is what the panel's Tab key asks. It lists directories only, and it
 # says nothing at all when there is no match, because a field that is being
 # typed into must not sprout an error the moment the stem stops matching.
-mkdir -p "$TMP/project" "$TMP/project-two" "$TMP/other" "$TMP/AgentTalk" "$TMP/.hidden"
+mkdir -p "$TMP/project" "$TMP/project-two" "$TMP/other" "$TMP/AgentTalk" "$TMP/.hidden" \
+  "$TMP/other/deep" "$TMP/elsewhere"
 touch "$TMP/a file"
 # $TMP also holds the state directory, so the listing is compared by what it
 # does and does not contain rather than by an exact copy of the whole list.
 check "complete with no stem lists the directories under a prefix" \
-  "$("$AGENTTALK" complete "$TMP/" | tr '\n' ' ')" "AgentTalk other project project-two state "
+  "$("$AGENTTALK" complete "$TMP/" | tr '\n' ' ')" "AgentTalk elsewhere other project project-two state "
 check "complete narrows to the stem" \
   "$("$AGENTTALK" complete "$TMP/" project | tr '\n' ' ')" "project project-two "
 check "complete returns the whole match for a unique stem" \
@@ -224,6 +225,32 @@ check "complete matches a lowercase stem against a capitalised directory" \
   "$("$AGENTTALK" complete "$TMP/" AGENTTALK)" "AgentTalk"
 check "complete still prefers the exact case over a case-insensitive match" \
   "$("$AGENTTALK" complete "$TMP/" project | tr '\n' ' ')" "project project-two "
+
+# A slash inside the stem is part of the path, not part of the name. The panel
+# splits the field at its last slash, so it never sends one, but Tab puts a
+# trailing slash there after a unique match and a person at a terminal types
+# `other/dee` as a single string. Both are answered the same way, because a stem
+# that cannot match anything is silence where a directory is sitting right
+# there, and silence in this field reads as "no such directory".
+check "complete still returns the whole match for a plain unique stem" \
+  "$("$AGENTTALK" complete "$TMP/" other)" "other"
+check "complete with a trailing slash lists what is inside" \
+  "$("$AGENTTALK" complete "$TMP/other/" | tr '\n' ' ')" "deep "
+check "complete reads a trailing slash in the stem as inside" \
+  "$("$AGENTTALK" complete "$TMP/" "other/" | tr '\n' ' ')" "deep "
+check "complete reads a slash in the middle of the stem as a path" \
+  "$("$AGENTTALK" complete "$TMP/" "other/dee")" "deep"
+check "complete is quiet for a trailing slash that names no directory" \
+  "$("$AGENTTALK" complete "$TMP/" "nope/" 2>/dev/null | tr -d '\n')" ""
+
+# A path that does not start at the root means the user's home directory, which
+# is what the panel sends and where a bare name in the field belongs. Resolving
+# it against the working directory instead would make the answer depend on
+# wherever the shell happened to start, so this checks a directory that exists
+# only under the cwd and asks for it by that name: it must not be found.
+mkdir -p "$TMP/elsewhere/decoy"
+check "complete does not resolve a relative path against the working directory" \
+  "$(cd "$TMP/elsewhere" && "$AGENTTALK" complete "decoy/" | tr -d '\n')" ""
 
 # A dot directory at the front of a list moves the common prefix of everything
 # behind it, so they are hidden unless asked for by name.
