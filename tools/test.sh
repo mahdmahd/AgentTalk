@@ -191,12 +191,12 @@ check "cd fails for an agent that does not exist" \
 # `complete` is what the panel's Tab key asks. It lists directories only, and it
 # says nothing at all when there is no match, because a field that is being
 # typed into must not sprout an error the moment the stem stops matching.
-mkdir -p "$TMP/project" "$TMP/project-two" "$TMP/other"
+mkdir -p "$TMP/project" "$TMP/project-two" "$TMP/other" "$TMP/AgentTalk" "$TMP/.hidden"
 touch "$TMP/a file"
 # $TMP also holds the state directory, so the listing is compared by what it
 # does and does not contain rather than by an exact copy of the whole list.
 check "complete with no stem lists the directories under a prefix" \
-  "$("$AGENTTALK" complete "$TMP/" | tr '\n' ' ')" "other project project-two state "
+  "$("$AGENTTALK" complete "$TMP/" | tr '\n' ' ')" "AgentTalk other project project-two state "
 check "complete narrows to the stem" \
   "$("$AGENTTALK" complete "$TMP/" project | tr '\n' ' ')" "project project-two "
 check "complete returns the whole match for a unique stem" \
@@ -213,6 +213,33 @@ check "complete expands a ~ prefix" \
   "$("$AGENTTALK" complete "~" | head -1 | grep -c .)" "1"
 check "complete with no prefix lists the home directory" \
   "$([[ -d "$HOME/$("$AGENTTALK" complete "" | head -1)" ]] && echo yes)" "yes"
+
+# The panel is not a shell. It has no case-sensitivity muscle memory, and a
+# case-sensitive match answers `agent` with silence where `AgentTalk` is right
+# there -- and silence in a field that is being typed into reads as a broken
+# completion, so the user presses Enter and gets told the directory is missing.
+check "complete matches the stem regardless of case" \
+  "$("$AGENTTALK" complete "$TMP/" agenttalk)" "AgentTalk"
+check "complete matches a lowercase stem against a capitalised directory" \
+  "$("$AGENTTALK" complete "$TMP/" AGENTTALK)" "AgentTalk"
+check "complete still prefers the exact case over a case-insensitive match" \
+  "$("$AGENTTALK" complete "$TMP/" project | tr '\n' ' ')" "project project-two "
+
+# A dot directory at the front of a list moves the common prefix of everything
+# behind it, so they are hidden unless asked for by name.
+check "complete hides a dot directory by default" \
+  "$("$AGENTTALK" complete "$TMP/" | grep -c '^\.')" "0"
+check "complete offers a dot directory when the stem asks for one" \
+  "$("$AGENTTALK" complete "$TMP/" .hidden)" ".hidden"
+check "complete does not offer a dot directory to a plain stem" \
+  "$("$AGENTTALK" complete "$TMP/" hid | tr -d '\n')" ""
+
+# `cd` names the two ways a path can be wrong differently, because a file that
+# is visibly right there is not a typo.
+check "cd says a file is not a directory" \
+  "$("$AGENTTALK" cd build "$TMP/a file" 2>&1 >/dev/null)" "agenttalk: not a directory: $TMP/a file"
+check "cd still says no such directory for a path that is not there" \
+  "$("$AGENTTALK" cd build "$TMP/nope" 2>&1 >/dev/null)" "agenttalk: no such directory: $TMP/nope"
 
 # A pinned workdir is what a run uses when the panel does not name one, which
 # is the whole point of pinning it: the run happens where the user said, not

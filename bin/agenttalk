@@ -270,7 +270,17 @@ cmd_cd() {
     *)
       pinned="true"
       resolved=$(expand_path "$target")
-      [[ -d "$resolved" ]] || { log "no such directory: $target"; return 1; }
+      if [[ ! -d "$resolved" ]]; then
+        # A file is not a missing directory, and "no such directory" on a path
+        # that is visibly right there is the kind of message that sends someone
+        # looking for a typo that is not there.
+        if [[ -e "$resolved" ]]; then
+          log "not a directory: $target"
+        else
+          log "no such directory: $target"
+        fi
+        return 1
+      fi
       ;;
   esac
 
@@ -304,7 +314,22 @@ cmd_complete() {
   # bracket in it still completes instead of erroring out, and it never follows
   # a symlink into somewhere the user did not ask about.
   [[ -d "$dir" ]] || return 0
-  find "$dir/" -mindepth 1 -maxdepth 1 -type d -name "${stem}*" -printf '%f\n' 2>/dev/null | LC_ALL=C sort
+  # `-iname`, not `-name`: the panel is not a shell, so there is no
+  # case-sensitivity muscle memory to lean on, and a case-sensitive match turns
+  # `agent` into silence where `AgentTalk` is sitting right there. The silence is
+  # what makes it expensive, because the field cannot tell "no match" from "the
+  # completion is broken" and the next thing the user does is press Enter and be
+  # told the directory does not exist.
+  #
+  # A leading dot in the stem asks for the hidden ones, which is what a shell
+  # does and what makes `.local` reachable by typing it. Without that they are
+  # never offered, because one stray dot directory at the front of a list shifts
+  # the common prefix of everything behind it.
+  if [[ "$stem" == .* ]]; then
+    find "$dir/" -mindepth 1 -maxdepth 1 -type d -iname "${stem}*" -printf '%f\n' 2>/dev/null
+  else
+    find "$dir/" -mindepth 1 -maxdepth 1 -type d -iname "${stem}*" ! -name '.*' -printf '%f\n' 2>/dev/null
+  fi | LC_ALL=C sort -f
 }
 
 # ------------------------------------------------------------------- init

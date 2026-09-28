@@ -7,6 +7,40 @@ the only place a version number lives.
 
 ## [Unreleased]
 
+**1.3.0**
+
+### Added
+
+- The workspace field lists the directories its text matches while you type,
+  with the arrows and Enter to pick one. Completion was Tab-only and invisible:
+  a no-match and a broken completion looked the same, and the way to tell them
+  apart was to press Enter and be told the directory did not exist.
+- Dot directories are offered once you type a leading dot, the way a shell
+  treats them. They used to turn up in every list, where one of them shifts the
+  common prefix of everything behind it.
+
+### Changed
+
+- Completion matches the stem regardless of case. The panel is not a shell, so
+  there is no case-sensitivity muscle memory to lean on, and `agent` used to
+  find nothing where `AgentTalk` was sitting right there — in silence, which is
+  the most expensive kind of wrong answer in a field.
+- Enter takes the match when the text as typed is not a directory itself: the
+  path typed, else the chosen row, else the only match. A path that resolves to
+  nothing is no longer sent to `agenttalk cd` at all, so the field says `no
+  directory here matches` under itself and stays open, instead of the panel
+  answering a question nobody asked with a banner about a missing directory.
+- `agenttalk cd` says `not a directory` when the path is a file, rather than
+  claiming a directory does not exist when it is visibly right there.
+
+### Fixed
+
+- The workspace field no longer loses a keystroke or overwrites itself with a
+  stale answer. Tab pressed while a completion was running was dropped, and an
+  answer that came back after more was typed replaced the text with a path built
+  from the text as it was when the question was asked — both ending in a path
+  that does not exist.
+
 **1.2.0**
 
 ### Changed
