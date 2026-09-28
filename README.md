@@ -67,6 +67,11 @@ One conversation per agent, and they are independent: a `build` run keeps going
 while you talk to `plan`. The default agent is picked for you — your configured
 default, then opencode's `build`, then the first agent opencode lists.
 
+The rail on the left is grouped by the directory each agent will work in, and
+ordered by what wants your attention: something you have not read yet, then
+something working, then the rest. An agent that follows the focused window
+sits in a `following the window` group until you pin a path to it.
+
 ### Settings
 
 Right-click the bar icon, or set a value from the terminal:

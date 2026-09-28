@@ -30,6 +30,9 @@ Item {
   // blocks, and a rewritten block keeps the count too.
   property string eventsRaw: ""
   property string metaRaw: ""
+  // The rail's inputs, folded into one string so a change can be compared
+  // without watching four bindings.
+  property string statusKey: ""
 
   readonly property bool running: !!(meta && meta.running === true)
   readonly property string workdir: (meta && meta.workdir) ? String(meta.workdir) : ""
@@ -37,10 +40,20 @@ Item {
   // of the window they happened to be looking at. The panel shows a different
   // label for each, because only a pinned one survives moving to another window.
   readonly property bool workdirPinned: !!(meta && meta.workdirPinned === true)
+  // Null until a run has finished once, which is the only difference between
+  // "idle" and "never started" in the rail.
+  readonly property int exitCode: (meta && meta.exitCode !== undefined && meta.exitCode !== null)
+    ? Number(meta.exitCode)
+    : -1
 
   // Fires whenever the transcript grew, so the panel can badge an agent the
   // user is not currently looking at.
   signal transcriptGrew()
+  // Fires when the fields the rail groups and orders by change. A binding on
+  // `running` would not do: the session object is the same object before and
+  // after a run starts, so a map rebuilt only when sessions are added would go
+  // on drawing the state the panel opened with.
+  signal statusChanged()
 
   function loadMeta(content) {
     var text = String(content === undefined || content === null ? "" : content)
@@ -51,6 +64,12 @@ Item {
     } catch (e) {
       meta = {}
     }
+    // Only the rail's inputs are compared, so a session id changing does not
+    // rebuild a list the user is looking at for no visible reason.
+    var key = [running, workdir, workdirPinned, exitCode].join("|")
+    if (key === statusKey) return
+    statusKey = key
+    statusChanged()
   }
 
   function loadEvents(content) {

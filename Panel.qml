@@ -60,6 +60,10 @@ Panel {
   // painted exactly like one that can, so an action that is merely not
   // applicable yet reads as a broken panel. Dimming is the whole fix.
   readonly property real disabledDim: 0.4
+  // What a group heading reads as a state: it has none, but the rows in a
+  // delegate share their bindings, and a missing object there is an error on
+  // every repaint rather than an empty line.
+  readonly property var noState: ({label: "", tone: "idle"})
 
   // ------------------------------------------------------------------ state
 
@@ -79,6 +83,24 @@ Panel {
   // know whether anything is working even when this panel was never opened.
   property var sessions: ({})
   property var unread: ({})
+  // The rail: group headings and agent rows in one flat list, so one ListView
+  // draws the whole thing and the scrollbar stays honest. `railOrder` is the
+  // same rows without the headings, because the arrow keys walk agents and
+  // must not stop on a label.
+  property var rail: []
+  property var railOrder: []
+
+  // The cursor's row in the flat list, which the ListView needs for its own
+  // currentIndex. Computed from the rail rather than tracked, because the list
+  // is rebuilt as a whole every time anything in it changes.
+  readonly property int cursorRow: {
+    if (cursorIndex < 0 || cursorIndex >= railOrder.length) return -1
+    var id = railOrder[cursorIndex]
+    for (var i = 0; i < rail.length; i++) {
+      if (rail[i].kind === "agent" && rail[i].id === id) return i
+    }
+    return -1
+  }
 
   readonly property var selected: sessions[selectedId] !== undefined ? sessions[selectedId] : null
   readonly property var blocks: selected && selected.blocks ? selected.blocks : []
@@ -108,6 +130,10 @@ Panel {
       editor.forceActiveFocus()
     }
   }
+
+  // A forced working directory overrides every agent's workspace, so it moves
+  // the whole rail into one group at once.
+  onConfiguredWorkDirChanged: rebuildRail()
 
   Component.onCompleted: refreshAgents()
 
@@ -155,7 +181,32 @@ Panel {
     fire(["init"].concat(wanted))
 
     if (map[selectedId] === undefined || selectedId === "") selectedId = pickDefault()
-    cursorIndex = Math.max(0, indexOfAgent(selectedId))
+    rebuildRail()
+    cursorIndex = Math.max(0, railIndex(selectedId))
+  }
+
+  // The rail is derived, never stored: every source of it is already on this
+  // object, and a cached copy is a copy that can disagree with the sessions.
+  // Rebuilt when an agent appears, when one changes state, and when a badge
+  // comes or goes - those are the only three things that move a row.
+  function rebuildRail() {
+    var built = Model.agentRail(agents, sessions, unread, configuredWorkDir)
+    rail = built.rows
+    railOrder = built.order
+    if (railOrder.length === 0) {
+      cursorIndex = -1
+      return
+    }
+    if (cursorIndex < 0 || cursorIndex >= railOrder.length) {
+      cursorIndex = Math.max(0, railIndex(selectedId))
+    }
+  }
+
+  // Where an agent sits in the rail, which is the order the arrow keys walk -
+  // not the order opencode listed the agents in.
+  function railIndex(id) {
+    for (var i = 0; i < railOrder.length; i++) if (railOrder[i] === id) return i
+    return -1
   }
 
   // opencode ships `build` as its general-purpose agent and marks the agents it
@@ -190,6 +241,7 @@ Panel {
     var session = sessionComponent.createObject(root, {agentId: id})
     if (!session) return null
     session.transcriptGrew.connect(function() { onTranscriptGrew(id) })
+    session.statusChanged.connect(function() { onSessionStatus(id) })
     return session
   }
 
@@ -203,12 +255,22 @@ Panel {
     if (!sessions[id]) return
     unread[id] = (unread[id] || 0) + 1
     unread = Object.assign({}, unread)
+    // A badge outranks a running row, so the rail has to be rebuilt with it.
+    rebuildRail()
+  }
+
+  // A run starting, ending or being pointed at another directory all move rows
+  // between groups, and the rail is grouped and ordered by exactly those.
+  function onSessionStatus(id) {
+    if (railOrder.length === 0) return
+    rebuildRail()
   }
 
   function markRead(id) {
     if (!unread[id]) return
     unread[id] = 0
     unread = Object.assign({}, unread)
+    rebuildRail()
   }
 
   // ------------------------------------------------------------------ input
@@ -504,25 +566,28 @@ Panel {
 
   // -------------------------------------------------------------- navigation
 
+  // The arrow keys walk the rail as the eye does: a group heading is not a
+  // place you can land, so Up from the first agent of a group goes to the last
+  // agent of the group above it rather than stopping on the label.
   function moveCursor(delta) {
-    if (agents.length === 0) return
+    if (railOrder.length === 0) return
     var index = cursorIndex < 0 ? 0 : cursorIndex + delta
-    cursorIndex = Math.max(0, Math.min(agents.length - 1, index))
+    cursorIndex = Math.max(0, Math.min(railOrder.length - 1, index))
     cursorActive = true
   }
 
   function cycleAgent(direction) {
-    if (agents.length === 0) return
-    var index = indexOfAgent(selectedId)
+    if (railOrder.length === 0) return
+    var index = railIndex(selectedId)
     if (index < 0) index = 0
-    index = ((index + direction) % agents.length + agents.length) % agents.length
+    index = ((index + direction) % railOrder.length + railOrder.length) % railOrder.length
     cursorIndex = index
-    selectAgent(agents[index].id)
+    selectAgent(railOrder[index])
   }
 
   function activateCursor() {
-    if (cursorIndex < 0 || cursorIndex >= agents.length) return
-    selectAgent(agents[cursorIndex].id)
+    if (cursorIndex < 0 || cursorIndex >= railOrder.length) return
+    selectAgent(railOrder[cursorIndex])
     editor.forceActiveFocus()
   }
 
@@ -616,8 +681,8 @@ Panel {
               Layout.fillHeight: true
               clip: true
               spacing: 1
-              model: root.agents
-              currentIndex: root.cursorIndex
+              model: root.rail
+              currentIndex: root.cursorRow
               boundsBehavior: Flickable.StopAtBounds
               ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
@@ -626,18 +691,48 @@ Panel {
                 required property int index
                 required property var modelData
 
-                readonly property string agentId: modelData.id
-                readonly property var session: root.sessions[agentId] !== undefined ? root.sessions[agentId] : null
-                readonly property bool busy: !!(session && session.running)
-                readonly property bool isSelected: agentId === root.selectedId
-                readonly property bool hot: hoverArea.containsMouse
-                  || (root.cursorActive && index === root.cursorIndex)
-                readonly property int unseen: root.unread[agentId] || 0
+                readonly property bool isGroup: modelData.kind === "group"
+                readonly property string agentId: isGroup ? "" : modelData.id
+                readonly property bool busy: !isGroup && modelData.running === true
+                readonly property bool isSelected: !isGroup && agentId === root.selectedId
+                // The cursor counts agents, this list counts headings too, so the
+                // two are matched on the row's own slot in the rail rather than
+                // on its index here.
+                readonly property bool hot: !isGroup && (hoverArea.containsMouse
+                  || (root.cursorActive && modelData.slot === root.cursorIndex))
+                readonly property int unseen: isGroup ? 0 : modelData.unseen
+                // A heading has no state and a row has no label, and hiding a
+                // Text does not stop QML from evaluating its bindings: each kind
+                // of row reads both through here, or a hidden binding throws on
+                // every repaint.
+                readonly property string rowLabel: isGroup ? String(modelData.label) : ""
+                readonly property var rowState: isGroup ? root.noState : modelData.state
 
                 width: agentList.width
-                height: Style.space(40)
+                height: isGroup ? Style.space(22) : Style.space(40)
+
+                // A group heading is the directory its agents will work in, and
+                // the only place in the panel that says so for a list of them.
+                // Full path, elided from the left: two projects can share a
+                // basename, and a heading that cannot tell them apart groups
+                // nothing.
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.spacing.md
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.spacing.md
+                  anchors.verticalCenter: parent.verticalCenter
+                  visible: agentRow.isGroup
+                  text: agentRow.rowLabel
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  elide: Text.ElideLeft
+                }
 
                 Rectangle {
+                  visible: !agentRow.isGroup
                   anchors.fill: parent
                   anchors.leftMargin: Style.spacing.xs
                   anchors.rightMargin: Style.spacing.xs
@@ -649,6 +744,7 @@ Panel {
                 }
 
                 Column {
+                  visible: !agentRow.isGroup
                   anchors.left: parent.left
                   anchors.leftMargin: Style.spacing.md
                   anchors.right: marker.left
@@ -666,10 +762,15 @@ Panel {
                     elide: Text.ElideRight
                   }
 
+                  // What the run is doing, not what the agent is: `mode` is a
+                  // property of the agent type, so it printed the same word on
+                  // every idle row - a line of text that never changed.
                   Text {
                     width: parent.width
-                    text: agentRow.busy ? "working" : agentRow.modelData.mode
-                    color: agentRow.busy ? root.accent : root.dim
+                    text: agentRow.rowState.label
+                    color: agentRow.rowState.tone === "working"
+                      ? root.accent
+                      : (agentRow.rowState.tone === "failed" ? root.urgentColor : root.dim)
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     elide: Text.ElideRight
@@ -680,6 +781,7 @@ Panel {
                 // that it is working, and that it finished while you were away.
                 Rectangle {
                   id: marker
+                  visible: !agentRow.isGroup
                   width: Math.max(badge.width, Style.space(8))
                   height: width
                   radius: width / 2
@@ -703,11 +805,12 @@ Panel {
 
                 MouseArea {
                   id: hoverArea
+                  visible: !agentRow.isGroup
                   anchors.fill: parent
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
                   onClicked: {
-                    root.cursorIndex = agentRow.index
+                    root.cursorIndex = agentRow.modelData.slot
                     root.selectAgent(agentRow.agentId)
                     editor.forceActiveFocus()
                   }
