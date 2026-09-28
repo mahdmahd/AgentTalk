@@ -1,0 +1,50 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # qmllint needs Omarchy's qs.Commons/qs.Ui imports, which a plain runner
+      # does not have, so it stays a local step: see AGENTS.md.
+      - name: Manifest is well formed
+        run: |
+          jq -e '
+            .version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")
+          ' manifest.json > /dev/null
+          for key in id name description author version license entryPoints; do
+            jq -e "has(\"$key\") and (.[\"$key\"] != null)" manifest.json > /dev/null \
+              || { echo "manifest.json is missing $key"; exit 1; }
+          done
+          for file in $(jq -r '.entryPoints[]' manifest.json); do
+            test -f "$file" || { echo "entryPoint $file does not exist"; exit 1; }
+          done
+          test -f LICENSE || { echo "no LICENSE at the repository root"; exit 1; }
+          test -f README.md || { echo "no README.md at the repository root"; exit 1; }
+
+      - name: Shell scripts parse
+        run: |
+          bash -n bin/agenttalk
+          bash -n tools/test.sh
+
+      - name: Tools parse
+        run: python3 -m py_compile tools/svg2qml.py
+
+      - name: Script behaviour
+        run: bash tools/test.sh
+
+      - name: Changelog has an Unreleased section
+        run: grep -q '^## \[Unreleased\]' CHANGELOG.md

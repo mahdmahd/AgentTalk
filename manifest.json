@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ramackersjp.agenttalk",
+  "name": "AgentTalk",
+  "version": "1.1.0",
+  "author": "J.P. Ramackers",
+  "license": "MIT",
+  "description": "Talk to your opencode agents from a panel in the Omarchy bar: type a task or paste an error, pick the agent, and watch it work.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "AgentTalk",
+    "description": "A bar button that opens your agents: one conversation per agent, agents on the left, the input on the right.",
+    "category": "AI",
+    "aliases": ["agenttalk", "agent-chat", "opencode"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "autoApprove": true,
+      "defaultAgent": "",
+      "workDir": ""
+    },
+    "schema": [
+      {
+        "key": "autoApprove",
+        "type": "boolean",
+        "label": "Auto-approve tool permissions",
+        "defaultValue": true,
+        "description": "Lets an agent edit files and run commands without stopping for a question. With this off, a run halts at the first permission request until you answer it in a terminal."
+      },
+      {
+        "key": "defaultAgent",
+        "type": "string",
+        "label": "Default agent",
+        "defaultValue": "",
+        "description": "Agent selected when the panel opens. Empty picks build if opencode has one, otherwise the first agent."
+      },
+      {
+        "key": "workDir",
+        "type": "path",
+        "label": "Working directory",
+        "defaultValue": "",
+        "description": "Where agents run. Empty means the directory of the window you are focused on, so a terminal in a project is the obvious answer."
+      }
+    ]
+  }
+}
