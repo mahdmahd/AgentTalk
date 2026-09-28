@@ -78,6 +78,44 @@ Panel {
   // user is typing in it.
   property bool workspaceEditing: false
   property string workspaceDraft: ""
+  // What the typed stem matches, newest answer last, as the paths the panel
+  // would store. Paths, not names, so that nothing has to decide twice whether
+  // `~/Code/AgentTalk` and `/home/jp/Code/AgentTalk` are the same place, and so
+  // that a row can show a directory name without also having to re-derive the
+  // directory it is in.
+  property var suggestPaths: []
+  // -1 means "nothing chosen", which is not the same as "chosen the first one":
+  // Enter has to be able to mean "the path I typed" without a row being lit.
+  property int suggestIndex: -1
+  // "none" only after a question came back empty, which is the only state in
+  // which there is something to say about a path that does not exist. It is not
+  // derived from `suggestPaths.length` so that the first keystroke, before any
+  // answer has arrived, is not reported as a path that cannot be found.
+  property string suggestSaid: ""
+  // Counts the questions asked of the script. A completion answer is only shown
+  // when no newer question has been asked since, which is the whole of the
+  // "you typed while find was running" race.
+  property int suggestSeq: 0
+
+  // Why the script refused the last path, or "" while there is nothing to say.
+  // It belongs under the field rather than in the notice because it is an
+  // answer to something the user just asked, with the text they typed still
+  // sitting there waiting for the next keystroke to fix it.
+  property string workspaceProblem: ""
+
+  // The single line under the field, if there is one. Either the script's own
+  // refusal, which is the only authority here on whether a path is a directory,
+  // or the fact that nothing here starts with what has been typed. That second
+  // one is a statement about the list and not about the path, and it is worded
+  // that way on purpose: "no directory here matches" read as "the directory you
+  // typed is not there" one keystroke before a trailing slash makes that true
+  // and false again.
+  readonly property string workspaceNote: {
+    if (!workspaceEditing) return ""
+    if (workspaceProblem !== "") return workspaceProblem
+    if (suggestPaths.length === 0 && suggestSaid === "none") return "nothing here starts with that"
+    return ""
+  }
 
   // One Session per agent, all of them alive from the start: the bar icon has to
   // know whether anything is working even when this panel was never opened.
@@ -315,23 +353,27 @@ Panel {
   // `agenttalk cd` away. The pin is the panel's own state, kept per agent in
   // meta.json, so it survives a reload and a shell restart.
 
-  function setWorkspace(path) {
+  // The one place a workspace is stored. It takes an absolute path and hands it
+  // to the script; the script is also the one that says whether the path is a
+  // directory, so a refusal comes back into the field that asked.
+  function commitWorkspace(absolute) {
     if (selectedId === "") return
     var agent = selectedId
-    var target = String(path === undefined || path === null ? "" : path).trim()
     workspaceEditing = false
-    if (target === "") return
-    // `agenttalk cd` resolves a relative path against its own working
-    // directory, which for a panel is wherever the shell happened to start.
-    // Someone typing a workspace into a panel means it from their home
-    // directory, so that is what gets sent.
-    var absolute = target === "~" ? home
-      : (target.indexOf("~/") === 0 ? home + target.substring(1)
-      : (target.indexOf("/") === 0 ? target
-      : home + "/" + target))
+    workspaceProblem = ""
+    suggestPaths = []
+    suggestIndex = -1
+    if (absolute === "") return
     // The notice names the directory the script stored, not this guess at it.
     report(["cd", agent, absolute], function(out) {
       flash(agent + " will work in " + (out === "" ? absolute : out))
+    }, function(problem) {
+      // The field reopens around the text that was refused. Closing it and
+      // saying so in a banner leaves a path the user cannot see being told it
+      // does not exist, and makes them type it again to find out why.
+      workspaceEditing = true
+      workspaceProblem = problem.replace(/^agenttalk: /, "")
+      focusWorkspaceField(false)
     })
   }
 
@@ -349,25 +391,62 @@ Panel {
     report(["cd", agent, "--reset"], function() { flash(agent + " uses the window you are on") })
   }
 
+  // Put text in the field and react to it. The prefill and every keystroke go
+  // through here, so what the field holds and what the list offers cannot drift
+  // apart. Assigning `workspaceField.text` by hand is deliberate: the first
+  // keystroke takes the `text: workspaceDraft` binding away for good, so the
+  // value has to be written on every visit, not just the first one.
+  //
+  // `keepList` is for the paths that move the text without asking a new
+  // question. Walking the list highlights a row, and the field has to show that
+  // row's path, but the list is a menu of the directories being chosen between:
+  // replacing it with the contents of the one being looked at turns one choice
+  // into a walk into the disk, which is not what the arrows mean.
+  function setWorkspaceDraft(text, keepList) {
+    workspaceDraft = text
+    workspaceField.text = text
+    // A new question voids the old answer, and the old refusal with it.
+    workspaceProblem = ""
+    if (keepList) return
+    // The old answer describes the old text. Clearing it is also what keeps the
+    // "nothing here starts with that" row from appearing during the moment
+    // before the new answer arrives.
+    suggestPaths = []
+    suggestIndex = -1
+    suggestSaid = ""
+  }
+
+  // The field only exists after the `workspaceEditing` state change, so the focus
+  // has to wait for the next frame, and where the caret goes a frame after
+  // that: selectAll() asked for in the same tick as the focus lands on an empty
+  // selection, which left the caret at the start of the path. The prefill is
+  // absolute and people type `~/...` into it, so a caret in front of it means
+  // every keystroke splices a new path onto the old one instead of replacing it.
+  //
+  // `select` is that prefill, where the next keystroke should replace the whole
+  // path. After a refusal the text is already right and only the last segment
+  // is wrong, so the caret goes to the end of it and the next keystroke lands
+  // where the mistake is.
+  function focusWorkspaceField(select) {
+    Qt.callLater(function() {
+      workspaceField.forceActiveFocus()
+      Qt.callLater(function() {
+        if (select) workspaceField.selectAll()
+        else workspaceField.cursorPosition = workspaceField.text.length
+      })
+    })
+  }
+
   function editWorkspace() {
     if (selectedId === "") return
     // Prefill with where the next run would go, so changing one segment of a
-    // long path does not mean typing the rest of it. The field is assigned as
-    // well as the draft: typing in it takes the text binding away for good, so
-    // the prefill has to be explicit or a second visit shows the last attempt.
-    workspaceDraft = effectiveWorkdir
-    workspaceField.text = workspaceDraft
+    // long path does not mean typing the rest of it.
+    setWorkspaceDraft(effectiveWorkdir)
     workspaceEditing = true
-    // The field only exists after this state change, so the focus has to wait
-    // for the next frame, and the selection a frame after that: selectAll()
-    // asked for in the same tick as the focus lands on an empty selection,
-    // which left the caret at the start of the path. The prefill is absolute
-    // and people type `~/...` into it, so a caret in front of it means every
-    // keystroke splices a new path onto the old one instead of replacing it.
-    Qt.callLater(function() {
-      workspaceField.forceActiveFocus()
-      Qt.callLater(function() { workspaceField.selectAll() })
-    })
+    focusWorkspaceField(true)
+    // The list opens on what is already in the field, so the field never sits
+    // there with nothing to say about a path that may not exist.
+    Qt.callLater(function() { root.refreshSuggestions() })
   }
 
   function flash(message) {
@@ -385,11 +464,14 @@ Panel {
   }
 
   // The same, but a failure has to reach the user. An agent that silently
-  // refuses to start is the worst outcome this panel has.
-  function report(args, ok) {
+  // refuses to start is the worst outcome this panel has. `fail` is for the
+  // cases where a failure belongs next to the thing that asked for it, in the
+  // field, rather than in a banner that arrives after the field is gone.
+  function report(args, ok, fail) {
     if (actionProcess.running) return
     actionProcess.command = [cli].concat(args)
     actionProcess.onOk = ok
+    actionProcess.onFail = fail || null
     actionProcess.running = true
   }
 
@@ -398,13 +480,15 @@ Panel {
   // onExited instead, one callLater tick after the process is gone so the
   // collectors have been flushed. The collectors reset per run, so a reused
   // Process never sees the previous run's bytes.
-  function collect(process, code, ok) {
+  function collect(process, code, ok, fail) {
     Qt.callLater(function() {
       var out = String(process.stdoutCollector.text || "").trim()
       var err = String(process.stderrCollector.text || "").trim()
       var message = out !== "" ? out : err
       if (code !== 0) {
-        root.flash(message === "" ? ("agenttalk failed (" + code + ")") : message)
+        var problem = message === "" ? ("agenttalk failed (" + code + ")") : message
+        if (fail) fail(problem)
+        else root.flash(problem)
         return
       }
       if (ok) ok(out)
@@ -459,18 +543,21 @@ Panel {
     // Set per call by `report` and cleared here: a command that is dropped
     // because another one is still going must not run its callback later.
     property var onOk: null
+    property var onFail: null
     stdout: stdoutCollector
     stderr: stderrCollector
     onExited: function(code) {
       var ok = actionProcess.onOk
+      var fail = actionProcess.onFail
       actionProcess.onOk = null
+      actionProcess.onFail = null
       root.collect(actionProcess, code, function(out) {
         // `run` detaches and prints its session id; that is progress, not a
         // failure, and the transcript shows it anyway. Every other command is
         // quiet on success, so anything it prints is worth surfacing.
         if (out !== "" && actionProcess.subcommand !== "run") root.flash(out)
         if (ok) ok(out)
-      })
+      }, fail)
     }
     // command[0] is the script itself, so the subcommand sits at index 1.
     property string subcommand: command.length > 1 ? command[1] : ""
@@ -511,46 +598,179 @@ Panel {
   Process {
     id: completeProcess
     command: [root.cli, "complete", ""]
-    running: false
+    // `running` belongs to the Process and a Process runs one command at a
+    // time, so the panel keeps its own two facts: whether this answer is still
+    // wanted, and what to ask next. Dropping the keystroke that arrived while a
+    // `find` was running loses a letter of what someone is typing, and letting
+    // the answer through after they have typed more overwrites their text with a
+    // path built from the text as it was when the question was asked. Both end
+    // in a path that does not exist.
+    property bool inFlight: false
+    property var wanted: null
+    property int askedSeq: 0
     property string base: ""
     property var stdoutCollector: StdioCollector { waitForEnd: true }
     property var stderrCollector: StdioCollector { waitForEnd: true }
     stdout: stdoutCollector
     stderr: stderrCollector
 
-    function complete(field) {
-      if (running) return
+    // Ask for what the field holds now. If something is already running, the
+    // answer to that is thrown away and this waits in `wanted` instead.
+    function ask(field) {
       var value = field.text
       var slash = value.lastIndexOf("/")
-      base = slash >= 0 ? value.slice(0, slash + 1) : ""
-      var stem = slash >= 0 ? value.slice(slash + 1) : value
-      completeProcess.command = [root.cli, "complete", base].concat(stem === "" ? [] : [stem])
+      wanted = {
+        base: slash >= 0 ? value.slice(0, slash + 1) : "",
+        stem: slash >= 0 ? value.slice(slash + 1) : value,
+        seq: ++root.suggestSeq
+      }
+      start()
+    }
+
+    function start() {
+      if (inFlight || wanted === null) return
+      var query = wanted
+      wanted = null
+      base = query.base
+      command = [root.cli, "complete", query.base].concat(query.stem === "" ? [] : [query.stem])
+      askedSeq = query.seq
+      inFlight = true
       running = true
     }
 
     onExited: function() {
+      inFlight = false
       // The collector's text is read a tick later, like every other process
       // here: on exit it can still be one line short of what the run wrote.
       var out = String(completeProcess.stdoutCollector.text || "")
       var base = completeProcess.base
-      Qt.callLater(function() { applyCompletion(base, out) })
+      var seq = completeProcess.askedSeq
+      // Anything asked for after this question has a newer answer to wait for,
+      // so this one is not shown: it describes a field that no longer exists.
+      if (seq === root.suggestSeq) Qt.callLater(function() { applyCompletion(base, out) })
+      start()
     }
   }
 
-  // One match fills the field, several share their common prefix, and nothing
-  // leaves the field alone. That is what a shell does too: type more to narrow
-  // the list rather than have a guess put in front of the user.
+  // The one statement that means "the list should now say what the field says".
+  // The debounce timer, the prefill and Tab all go through here, so there is one
+  // place where the field and the list are tied together.
+  function refreshSuggestions() {
+    completeProcess.ask(workspaceField)
+  }
+
+  // As you type, not when Tab is pressed. A field that only answers Tab makes
+  // "no match" and "broken" look the same, and the only way to find out which
+  // one it is used to be to press Enter and be told the directory is missing.
+  Timer {
+    id: suggestTimer
+    interval: 90
+    onTriggered: root.refreshSuggestions()
+  }
+
+  // Turn what the script returned into paths, and decide what Enter means.
   function applyCompletion(base, out) {
-    var names = out.trim().split("\n").filter(function(name) { return name !== "" })
+    var names = String(out).trim().split("\n").filter(function(name) { return name !== "" })
+    var stem = String(workspaceField.text).slice(base.length)
+    var paths = names.map(function(name) { return resolvePath(base + name) })
+    suggestPaths = paths
+    suggestSaid = names.length === 0 ? "none" : ""
+    // A row is only lit when there is a genuine choice to make. With one match,
+    // or with the text already naming a directory, Enter has nothing to ask.
+    var exact = names.indexOf(stem)
+    suggestIndex = exact >= 0 ? exact : (names.length > 1 ? 0 : -1)
+  }
+
+  // The path a name under `base` means, made absolute. `agenttalk cd` resolves a
+  // relative path against its own working directory, which for a panel is
+  // wherever the shell happened to start, so someone typing a workspace into a
+  // panel means it from their home directory. That is also where an empty
+  // prefix starts from, which is why a bare name lands in $HOME too.
+  function resolvePath(text) {
+    var home = root.home
+    if (text === "~") return home
+    if (text.indexOf("~/") === 0) return home + text.substring(1)
+    if (text.indexOf("/") === 0) return text
+    return home + "/" + text
+  }
+
+  // Tab still completes to the common prefix, because that is what Tab does and
+  // changing it would only make the muscle memory wrong. What it no longer does
+  // is replace the answer with a guess: the list is already on screen, so Tab
+  // extends the text and the list narrows itself.
+  function completeCommonPrefix() {
+    var names = suggestPaths.map(function(path) { return path.slice(path.lastIndexOf("/") + 1) })
     if (names.length === 0) return
+    var typed = String(workspaceField.text)
     var stem = names.length === 1 ? names[0] : commonPrefix(names)
     if (stem === "") return
-    workspaceDraft = base + stem + (names.length === 1 ? "/" : "")
-    workspaceField.text = workspaceDraft
-    workspaceField.cursorPosition = workspaceField.text.length
-    // The field is the panel's only focusable item while editing, and a
-    // Process run takes the panel's focus with it, so put it back.
+    var slash = typed.lastIndexOf("/")
+    var base = slash >= 0 ? typed.slice(0, slash + 1) : ""
+    var grown = base + stem + (names.length === 1 ? "/" : "")
+    setWorkspaceDraft(grown)
+    workspaceField.cursorPosition = grown.length
     workspaceField.forceActiveFocus()
+    root.refreshSuggestions()
+  }
+
+  // Enter hands the path to the script and lets it answer. The list says what
+  // exists that starts with what has been typed, which is a different question
+  // from "is this a directory", and a field that answers the second question
+  // itself is wrong the moment the two disagree -- one trailing slash is enough,
+  // because the list empties while the directory is right there. So the field
+  // stops guessing, and a refusal comes back into the field that asked for it.
+  function acceptWorkspace() {
+    if (selectedId === "") return
+    var field = String(workspaceField.text).trim()
+    if (field === "") return
+    var names = suggestPaths.map(function(path) { return path.slice(path.lastIndexOf("/") + 1) })
+    var stem = field.slice(field.lastIndexOf("/") + 1)
+    var target = resolvePath(field)
+    // The path as typed wins wherever the list agrees it exists. Where the list
+    // does not name what was typed, the lit row is the answer: that is the case
+    // `agent` finding `AgentTalk`, and the case where nothing is lit and there
+    // is one row left, which can only have been what was meant.
+    if (names.indexOf(stem) < 0) {
+      if (suggestIndex >= 0 && suggestIndex < suggestPaths.length) target = suggestPaths[suggestIndex]
+      else if (suggestPaths.length === 1) target = suggestPaths[0]
+    }
+    commitWorkspace(target)
+  }
+
+  // A row the user has moved to is a row they have chosen, so a click on it
+  // stores that directory instead of the text as it was when the list opened.
+  function chooseSuggestion(row) {
+    if (row < 0 || row >= suggestPaths.length) return
+    suggestIndex = row
+    commitWorkspace(suggestPaths[row])
+  }
+
+  // The text in the field and the row lit in the list are one choice shown
+  // twice, so walking either moves the other: scrolling a menu whose selection
+  // does not follow the text is scrolling past the directory that is about to be
+  // stored. The list itself stays the menu of directories being chosen between.
+  function moveSuggestion(delta) {
+    if (suggestPaths.length === 0) return
+    var next = suggestIndex < 0 ? 0 : suggestIndex + delta
+    suggestIndex = Math.max(0, Math.min(suggestPaths.length - 1, next))
+    showSuggestion()
+  }
+
+  function showSuggestion() {
+    if (suggestIndex < 0 || suggestIndex >= suggestPaths.length) return
+    setWorkspaceDraft(untildify(suggestPaths[suggestIndex]), true)
+    // A list taller than the box scrolls, so the lit row has to be brought into
+    // it: the tenth of twenty directories is chosen by arrowing past what fits.
+    suggestList.positionViewAtIndex(suggestIndex, ListView.Contain)
+  }
+
+  // `$HOME` is a prefix of every path worth typing and `~/` is what the person
+  // would have written. Spelled out in full it is a wall of text that pushes
+  // the part being chosen off the right edge of a panel.
+  function untildify(path) {
+    var home = root.home
+    if (home === "" || path.indexOf(home + "/") !== 0) return path
+    return "~" + path.substring(home.length)
   }
 
   function commonPrefix(names) {
@@ -896,6 +1116,7 @@ Panel {
             radius: Style.cornerRadius
 
             RowLayout {
+              id: workspaceRow
               anchors.fill: parent
               anchors.leftMargin: Style.spacing.sm
               anchors.rightMargin: Style.spacing.xs
@@ -956,16 +1177,35 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
 
-                onAccepted: root.setWorkspace(text)
+                onAccepted: root.acceptWorkspace()
+                // Every keystroke re-asks. The list, not Tab, is what makes a
+                // path recognisable while it is being typed.
+                onTextEdited: {
+                  root.setWorkspaceDraft(text)
+                  suggestTimer.restart()
+                }
                 Keys.onPressed: function(event) {
                   if (event.key === Qt.Key_Escape) {
-                    root.workspaceEditing = false
+                    // Escape closes the list before it gives up the field, so a
+                    // half-typed path can be walked away from one step at a time.
+                    if (root.suggestPaths.length > 0) {
+                      root.suggestPaths = []
+                      root.suggestIndex = -1
+                    } else {
+                      root.workspaceEditing = false
+                    }
                     event.accepted = true
                   } else if (event.key === Qt.Key_Tab) {
                     // Tab completes a directory here. While the field holds
                     // the focus the catcher never sees the key, so it cannot
                     // fall through to switching panels.
-                    completeProcess.complete(workspaceField)
+                    root.completeCommonPrefix()
+                    event.accepted = true
+                  } else if (event.key === Qt.Key_Down) {
+                    root.moveSuggestion(1)
+                    event.accepted = true
+                  } else if (event.key === Qt.Key_Up) {
+                    root.moveSuggestion(-1)
                     event.accepted = true
                   }
                 }
@@ -977,7 +1217,7 @@ Panel {
                 active: root.workspaceEditing
                 enabled: root.selectedId !== ""
                 opacity: enabled ? 1 : root.disabledDim
-                onClicked: root.workspaceEditing ? root.setWorkspace(workspaceField.text) : root.editWorkspace()
+                onClicked: root.workspaceEditing ? root.acceptWorkspace() : root.editWorkspace()
               }
 
               Button {
@@ -996,6 +1236,127 @@ Panel {
                 opacity: enabled ? 1 : root.disabledDim
                 onClicked: root.resetWorkspace()
               }
+            }
+
+            // The directories the typed stem matches, as they are found. An
+            // overlay rather than rows in the layout, because the transcript is
+            // right underneath and moving it every keystroke is worse than
+            // covering it while a field is open.
+            Rectangle {
+              id: suggestBox
+              z: 20
+              visible: root.workspaceEditing && (root.suggestPaths.length > 0 || root.suggestSaid === "none")
+              anchors.top: workspaceRow.bottom
+              anchors.topMargin: Style.spacing.xs
+              // Anchored to the row, not to the field: the field's parent is
+              // the row, so its left and right are not this box's coordinates,
+              // and anchoring to them gives a box no width at all. The row is
+              // this box's own parent, so it spans the panel under the field.
+              anchors.left: workspaceRow.left
+              anchors.leftMargin: Style.spacing.sm
+              anchors.right: workspaceRow.right
+              anchors.rightMargin: Style.spacing.xs
+              // Long enough for the choices, short enough that a big directory
+              // cannot push the field off the panel. Clamped here rather than
+              // on the list, which has no such property: the list fills the box
+              // and scrolls once the box stops growing.
+              height: Math.min(suggestList.contentHeight, Style.space(160)) + 2
+              color: root.normalFill
+              radius: Style.cornerRadius
+              border.width: 1
+              border.color: root.hoverBorder
+
+              ListView {
+                id: suggestList
+                anchors.fill: parent
+                anchors.margins: 1
+                clip: true
+                spacing: 0
+                model: root.suggestPaths
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                delegate: Item {
+                  id: suggestRow
+                  required property int index
+                  required property var modelData
+                  width: suggestList.width
+                  height: Style.space(26)
+
+                  Rectangle {
+                    anchors.fill: parent
+                    color: suggestRow.index === root.suggestIndex ? root.accent : "transparent"
+                    opacity: suggestRow.index === root.suggestIndex ? 0.18 : 1
+                  }
+
+                  Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.spacing.sm
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.spacing.sm
+                    anchors.verticalCenter: parent.verticalCenter
+                    // The directory on its own. The path it is in is already in
+                    // the field, and repeating it in every row is the part of a
+                    // file dialog that makes it unreadable.
+                    text: suggestRow.modelData.slice(suggestRow.modelData.lastIndexOf("/") + 1)
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideMiddle
+                  }
+
+                  // A row is a directory, so a click on it is the same decision
+                  // as arrowing to it and pressing Enter, and the list is close
+                  // enough to the field to be clicked at without aiming. It
+                  // takes a click and not a hover, because the lit row has to
+                  // mean the same thing however it got there: a row lit by
+                  // moving the mouse across it would be stored by the next Enter
+                  // while the field still showed something else.
+                  MouseArea {
+                    anchors.fill: parent
+                    onClicked: root.chooseSuggestion(suggestRow.index)
+                  }
+                }
+              }
+
+              // The wheel is the third way of walking the list, and the only one
+              // that also scrolls it: arrows move the lit row but leave the list
+              // where it is, which on a list taller than the box means the row
+              // being chosen is off the bottom. `target: null` because nothing
+              // here should be transformed by a wheel; this only reads it.
+              WheelHandler {
+                target: null
+                onWheel: function(event) {
+                  var delta = event.angleDelta.y
+                  if (delta === 0) return
+                  root.moveSuggestion(delta > 0 ? 1 : -1)
+                  event.accepted = true
+                }
+              }
+            }
+
+            // The one thing the field has to say when nothing matched, and the
+            // script's refusal when it refused one. It lives in the list rather
+            // than in a banner, because the banner is where "no such directory"
+            // used to arrive: five seconds, gone, and about a path the user can
+            // no longer see, which is the one thing they would have to retype.
+            Text {
+              id: suggestNone
+              z: 20
+              visible: root.workspaceNote !== ""
+              anchors.top: workspaceRow.bottom
+              anchors.topMargin: Style.spacing.xs
+              anchors.left: workspaceRow.left
+              anchors.leftMargin: Style.spacing.sm * 2
+              anchors.right: workspaceRow.right
+              anchors.rightMargin: Style.spacing.xs * 2
+              height: Style.space(26)
+              verticalAlignment: Text.AlignVCenter
+              text: root.workspaceNote
+              color: root.workspaceProblem === "" ? root.dim : root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
             }
           }
 
