@@ -7,7 +7,31 @@ the only place a version number lives.
 
 ## [Unreleased]
 
-**1.1.0**
+**1.2.0**
+
+### Changed
+
+- The rail is grouped by workspace and ordered by what wants your attention,
+  which is what a list of agents could never say on its own. It was opencode's
+  agent list in the order opencode returned it, with a type attribute where the
+  state should have been: eight agents and two of them mid-run gave you no way
+  to tell which two. Rows are now grouped under the directory their next run
+  happens in, and ordered unread first, then working, then idle — so the row
+  that needs you is the one at the top, and a group leads with its most urgent
+  row. An agent that follows the focused window gets a `following the window`
+  group of its own rather than borrowing the directory of its last run, which is
+  not where it works any more and would move as the pointer crossed windows.
+- A row's second line says what the run is doing instead of the agent's `mode`.
+  `mode` is a property of the agent type, so it printed the same word on every
+  idle row: a line of text that never changed. It is now `working`, `idle`,
+  `not started`, `stopped`, `timed out` or `failed` — the last three taken from
+  the exit codes the script already records, so a stop and a timeout are not
+  reported as failures.
+- Setting a working directory in the plugin settings puts the whole rail in one
+  group, because it overrides every agent's workspace. Following the focused
+  window keeps the agents in one group of their own.
+
+## [1.1.0]
 
 ### Added
 

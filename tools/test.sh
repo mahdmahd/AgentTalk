@@ -295,6 +295,36 @@ check "unbind leaves no agenttalk line behind" \
 check "unbind leaves a binding it does not own alone" \
   "$(grep -c 'ALT + SPACE' "$HYPR_DIR/bindings.lua" 2>/dev/null || true)" "1"
 
+# --- panel model -----------------------------------------------------------
+#
+# Model.js holds the only logic the panel runs that is not a QML binding, and
+# none of it can be checked by opening a panel. It runs under node, which is a
+# test-time need and not a runtime one: the plugin is still QML, bash, jq and
+# opencode. Skipped rather than failed where node is absent, so the suite stays
+# runnable on a machine that only has the plugin's own dependencies.
+
+if command -v node >/dev/null 2>&1; then
+  model_out=$(node "$ROOT/tools/test_model.js" 2>&1)
+  model_status=$?
+  printf '%s\n' "$model_out"
+  # Its own summary line, so the counts are the ones test_model.js actually
+  # printed rather than a number that has to be kept in step by hand.
+  model_line=$(printf '%s\n' "$model_out" | grep -E '^[0-9]+ passed, [0-9]+ failed$' | tail -1)
+  if [[ -n "$model_line" ]]; then
+    # Its own summary line, so the counts are the ones test_model.js actually
+    # printed rather than numbers that have to be kept in step by hand. Both
+    # halves are carried over: collapsing four broken assertions into one
+    # failure would make a green suite one edit away from a lie.
+    passed=$((passed + $(printf '%s' "$model_line" | cut -d' ' -f1)))
+    failed=$((failed + $(printf '%s' "$model_line" | cut -d' ' -f3)))
+  else
+    failed=$((failed + 1))
+    printf 'FAIL  Model.js (node failed without a summary)\n'
+  fi
+else
+  printf 'skip  Model.js (no node)\n'
+fi
+
 # --- summary ----------------------------------------------------------------
 
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
