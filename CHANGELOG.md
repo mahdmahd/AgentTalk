@@ -7,7 +7,7 @@ the only place a version number lives.
 
 ## [Unreleased]
 
-**1.3.0**
+## [1.3.0]
 
 ### Added
 
