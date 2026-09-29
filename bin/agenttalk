@@ -51,12 +51,18 @@ OPENCODE_BIN="${AGENTTALK_OPENCODE_BIN:-opencode}"
 RUN_TIMEOUT="${AGENTTALK_TIMEOUT:-3600}"
 HYPR_DIR="${HYPRLAND_CONFIG_DIR:-$HOME/.config/hypr}"
 
-# How much of the log the panel is given, and how much is kept when it is given
-# too much. Halving on every trim keeps the file from crossing the cap again
-# immediately, and a panel that loses the oldest half of a very long
-# conversation is showing the part the user is actually reading.
+# How much of the log the panel is given, and how much is left when it is given
+# too much. The cap is settled before each write rather than after, so the
+# newest event is never the thing at risk, and a panel that loses the oldest half
+# of a very long conversation is showing the part the user is actually reading.
 PANEL_LOG_MAX="${AGENTTALK_PANEL_LOG_MAX:-262144}"
 PANEL_LOG_KEEP="${AGENTTALK_PANEL_LOG_KEEP:-131072}"
+
+# The note that stands in for an event too big to show has to fit inside the very
+# budget it stands in for, so a budget smaller than the note is raised to it
+# rather than producing a note that cannot be written.
+PANEL_LOG_FLOOR=512
+((PANEL_LOG_MAX > PANEL_LOG_FLOOR)) || PANEL_LOG_MAX="$PANEL_LOG_FLOOR"
 
 log() { printf 'agenttalk: %s\n' "$*" >&2; }
 
@@ -85,56 +91,87 @@ agent_dir() {
   printf '%s/agents/%s' "$STATE_DIR" "$id"
 }
 
-# How many bytes the panel's view of a log holds, from the file itself. A worker
-# tracks its own count as it goes, but anything that appends from outside one
-# (the `append` subcommand, `stop`) has no counter to keep.
-panel_log_size() {
-  local panel="$1"
-  [[ -f "$panel" ]] || { printf '0'; return 0; }
-  stat -c%s "$panel" 2>/dev/null || printf '0'
+# How many bytes a file holds, from the file itself. A caller that appends in a
+# loop keeps the panel log's size from the count `append_event` hands back, but
+# the length of one event is not knowable from a counter before that event has
+# been written somewhere, so it is measured.
+file_size() {
+  local path="$1"
+  [[ -f "$path" ]] || { printf '0'; return 0; }
+  stat -c%s "$path" 2>/dev/null || printf '0'
 }
 
-# Cut the panel's log back to its last PANEL_LOG_KEEP bytes. The first line of a
-# byte-tail is half a line, and the panel already skips a line it cannot parse,
-# so dropping it costs nothing and keeps every line that is left complete.
+# What the panel shows in place of an event that is larger than the whole panel
+# budget. The event stays in the complete log; this is a `text` event, so the
+# panel needs no new shape to draw it. A blank transcript would look like a
+# broken plugin, and a tool result cut off mid-way is a thing a user might act on
+# as if it were the whole result.
+panel_standin() {
+  jq -nc --arg n "$1" \
+    '{t: "text", text: ("agenttalk: " + $n + " bytes of output are too large to show in the panel; the whole event is in events.jsonl")}'
+}
+
+# Cut the panel's log back to at most $2 bytes of its own tail. The caller says
+# how much room the event it is about to write needs, which is the whole point:
+# the newest event is written after the trim, so there is nothing here for a trim
+# to throw away and no window to widen when the tail comes back empty.
 #
-# When that leaves nothing, the newest event is larger than the window, and
-# dropping the whole transcript until the next event is worse than keeping more
-# of it: widen the window, never past the cap. A single event bigger than the cap
-# itself cannot be shown whole, and that is the one case where the panel log
-# legitimately ends up holding nothing usable.
+# The first line of a byte-tail is half a line, and the panel already skips a line
+# it cannot parse, so dropping it costs nothing and leaves whole lines behind.
 trim_panel_log() {
-  local panel="$1" tmp keep="$PANEL_LOG_KEEP"
+  local panel="$1" keep="$2" tmp
+  ((keep > 0)) || keep=1
   tmp=$(mktemp "$panel.trim.XXXXXX") || return 1
   if ! tail -c "$keep" "$panel" | sed 1d >"$tmp"; then
     rm -f "$tmp"
     return 1
   fi
-  while [[ ! -s "$tmp" ]] && ((keep < PANEL_LOG_MAX)); do
-    keep=$((keep * 2))
-    tail -c "$keep" "$panel" | sed 1d >"$tmp"
-  done
-  mv "$tmp" "$panel"
+  mv -f "$tmp" "$panel"
 }
 
 # Append one event to the complete log and to the panel's bounded view of it.
-# `bytes` is the caller's running count of the view: the worker has one and keeps
-# it as it goes, and a caller with no counter gets the size from the file, which
-# is one stat on a path that is not hot.
+#
+# The cap is settled before the write, never after it. The panel reads this file
+# the moment it changes, into the shell process that outlives everything else, so
+# a file that is briefly over the cap is a file that has already been read in
+# full: appending first and trimming afterwards bounds the log only in the state
+# nobody is looking at, and a single event larger than the cap made that state
+# last for as long as the trim took.
+#
+# An event's exact length is the growth of events.jsonl, not ${#event}: that
+# counts characters, so undercounting a UTF-8 event is a cap that quietly does
+# not hold in any conversation that is not pure ASCII.
+#
+# Prints the size of the panel log afterwards, so a caller appending in a loop
+# keeps a count without measuring the file itself on every event.
 append_event() {
   local dir="$1" event="$2" bytes="${3:-}" panel="$dir/panel.jsonl"
+  local before n keep
+  before=$(file_size "$dir/events.jsonl")
   printf '%s\n' "$event" >>"$dir/events.jsonl"
+  n=$(( $(file_size "$dir/events.jsonl") - before ))
+
+  if ((n > PANEL_LOG_MAX)); then
+    # Bigger than the entire budget, so no amount of trimming would make room
+    # for it. The panel gets the note in place of the whole log, written
+    # atomically so it is never seen empty.
+    write_atomic "$panel" <<<"$(panel_standin "$n")"
+    file_size "$panel"
+    return 0
+  fi
+
+  bytes=${bytes:-$(file_size "$panel")}
+  if ((bytes + n > PANEL_LOG_MAX)); then
+    # Make room first, keeping as much of the tail as still leaves the event
+    # room. Trimming here rather than afterwards is what guarantees the newest
+    # event is kept: it is written once the file is already small enough.
+    keep=$PANEL_LOG_KEEP
+    ((keep < PANEL_LOG_MAX - n)) || keep=$((PANEL_LOG_MAX - n))
+    trim_panel_log "$panel" "$keep" || return 0
+    bytes=$(file_size "$panel")
+  fi
   printf '%s\n' "$event" >>"$panel"
-  if [[ -n "$bytes" ]]; then
-    bytes=$((bytes + ${#event} + 1))
-  else
-    bytes=$(panel_log_size "$panel")
-  fi
-  if ((bytes > PANEL_LOG_MAX)); then
-    trim_panel_log "$panel" || return 0
-    bytes=$(panel_log_size "$panel")
-  fi
-  printf '%s' "$bytes"
+  printf '%s' "$((bytes + n))"
 }
 
 # `~` and a relative path are typed by humans; the panel and the event log want
@@ -715,7 +752,7 @@ worker() {
   touch "$events"
   # The count starts from the file, so a run that picks up an already long
   # conversation trims on its first event instead of waiting for its own.
-  panel_bytes=$(panel_log_size "$panel")
+  panel_bytes=$(file_size "$panel")
 
   # The worker is its own process, so it resolves opencode for itself: the
   # session it was spawned from may have been started from a different PATH.
@@ -814,15 +851,10 @@ worker() {
   ) 2>"$dir/stderr.log" \
     | normalize_stream \
     | while IFS= read -r event; do
-        # Both logs, counted in the loop rather than through `append_event`: that
-        # helper returns its count, and a command substitution would cost a fork
-        # on every event of every run to save a few lines of arithmetic.
-        printf '%s\n' "$event" >>"$events"
-        printf '%s\n' "$event" >>"$panel"
-        panel_bytes=$((panel_bytes + ${#event} + 1))
-        if ((panel_bytes > PANEL_LOG_MAX)); then
-          if trim_panel_log "$panel"; then panel_bytes=$(panel_log_size "$panel"); fi
-        fi
+        # `append_event` and not a second copy of the arithmetic: the two copies
+        # disagreed about when the cap was enforced, and the copy in here was
+        # the one that let an oversized event through.
+        panel_bytes=$(append_event "$dir" "$event" "$panel_bytes")
         # Every raw event carries the session id. The first one is all the next
         # turn needs to continue this conversation instead of starting over.
         if [[ -z "$session_id" && "$event" == '{"t":"session"'* ]]; then

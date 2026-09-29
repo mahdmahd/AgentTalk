@@ -81,10 +81,37 @@ printf '%s\n' '{"type":"session","sessionID":"ses_stub"}'
 printf '%s\n' '{"type":"text","part":{"text":"first"}}'
 printf '%s\n' '{"type":"text","part":{"text":"second"}}'
 printf '%s\n' '{"type":"tool_use","part":{"tool":"read","state":{"status":"completed","title":"README.md"}}}'
+# One event far larger than any panel budget, for the test that the file the
+# panel watches never gets that big. Off unless a test asks for it by size.
+if [[ -n "${STUB_HUGE:-}" ]]; then
+  printf '{"type":"text","part":{"text":"'
+  head -c "$STUB_HUGE" /dev/zero | tr '\0' 'x'
+  printf '"}}\n'
+fi
 printf '%s\n' '{"type":"error","part":{"error":"it went wrong"}}'
 printf '%s\n' '{"type":"done"}'
 EOF
   chmod +x "$stub"
+}
+
+# The largest size the panel's log ever reached while it was being written, and
+# the number of samples that saw it. `$(<file)` and ${#} are builtins, so this
+# samples fast enough to catch a window a few milliseconds wide, which a `stat`
+# per sample could miss. A sample that appears to be over the cap is measured
+# again with `stat`, so a violation is confirmed exactly rather than inferred
+# from a builtin that drops the trailing newline and is a byte short.
+watch_peak() {
+  local panel="$1" cap="$2" stop="$3" out="$4" peak=0 samples=0 content size
+  while [[ ! -f "$stop" ]]; do
+    if [[ -f "$panel" ]]; then
+      content=$(<"$panel")
+      size=${#content}
+      ((size > cap)) && size=$(stat -c%s "$panel" 2>/dev/null || printf 0)
+      samples=$((samples + 1))
+      ((size > peak)) && peak=$size
+    fi
+  done
+  printf '%s %s' "$peak" "$samples" >"$out"
 }
 
 TMP=$(mktemp -d)
@@ -241,6 +268,50 @@ check "the write that landed last is the one that is left" \
   "$(jq -r '.n' "$ALT/atomic/meta.json")" "999"
 check "a write leaves no temporary file behind" \
   "$(find "$ALT/atomic" -name 'meta.json.??????' | wc -l | tr -d ' ')" "0"
+
+# The cap is not a promise about the size at the end; it is a promise about the
+# size at every instant, because the panel reads this file on every change into
+# the shell process that outlives everything else. Settling the size after the
+# write bounds the log only in the state nobody is looking at, and one event
+# larger than the whole budget made that state last for as long as the trim took.
+#
+# So the assertion here is the largest size ever *observed*, sampled while a run
+# streams an event that is a hundred times the cap.
+HUGE_STATE="$ALT/huge"
+HUGE_LOG="$HUGE_STATE/agents/huge/panel.jsonl"
+HUGE_EVENTS="$HUGE_STATE/agents/huge/events.jsonl"
+PEAK_OUT="$ALT/peak"
+STOP_FLAG="$ALT/stop-watching"
+rm -f "$STOP_FLAG" "$PEAK_OUT"
+watch_peak "$HUGE_LOG" 2000 "$STOP_FLAG" "$PEAK_OUT" &
+watcher=$!
+printf 'go' | AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$HUGE_STATE" \
+  AGENTTALK_PANEL_LOG_MAX=2000 AGENTTALK_PANEL_LOG_KEEP=1000 STUB_HUGE=200000 \
+  "$AGENTTALK" run huge >/dev/null 2>&1
+wait_for_event "$HUGE_EVENTS" done 1
+: >"$STOP_FLAG"
+wait "$watcher"
+peak_read=$(<"$PEAK_OUT")
+peak=${peak_read% *}
+samples=${peak_read#* }
+# `wait_for_event` is not checked by the harness, so state the thing it was
+# waiting for: a run that stopped halfway would leave every assertion below true
+# for the wrong reason.
+check "the run finished, so the assertions below are not on a half-written log" \
+  "$(event_count "$HUGE_EVENTS" done)" "1"
+check "the panel's log never exceeded the cap while it was written" \
+  "$([[ "$peak" -le 2000 ]] && echo yes)" "yes"
+# Without this the assertion above is satisfied by a sampler that never ran.
+check "the sampler really did watch the file while it grew" \
+  "$([[ "$samples" -ge 50 ]] && echo yes)" "yes"
+check "an event bigger than the whole budget is not shown whole" \
+  "$(jq -r 'select((.text // "") | test("too large to show")) | .text' "$HUGE_LOG" | wc -l | tr -d ' ')" "1"
+check "the panel says how big it was instead of showing nothing" \
+  "$(jq -r 'select((.text // "") | test("too large to show")) | .text' "$HUGE_LOG" | grep -c '200')" "1"
+check "the big event is in the complete log in full" \
+  "$(jq -r 'select((.text // "") | length > 100000) | .text | length' "$HUGE_EVENTS")" "200000"
+check "the panel's log is small again once the run is over" \
+  "$([[ "$(stat -c%s "$HUGE_LOG")" -lt 2000 ]] && echo yes)" "yes"
 
 # --- run --------------------------------------------------------------------
 

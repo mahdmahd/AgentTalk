@@ -7,6 +7,25 @@ the only place a version number lives.
 
 ## [Unreleased]
 
+## [2.0.2]
+
+### Fixed
+
+- The panel's log could exceed its cap for as long as the trim took. The event
+  was appended first and the size checked afterwards, so a single event larger
+  than the whole cap made the file the panel watches briefly unbounded, and the
+  panel reads that file on every change. Room is now made before the write, and
+  an event that is larger than the entire cap is not written to the panel's log
+  at all: the panel says how large it was and the complete log keeps the event in
+  full. A test now measures the largest size the file ever *reached* while a run
+  streams an event a hundred times the cap, which is the claim that actually
+  matters.
+- The worker and the `append` subcommand had two copies of the panel-log
+  arithmetic, and they had drifted apart. There is one implementation now, and
+  the cap is settled from the event's real size in bytes rather than from
+  `${#event}`, which counts characters — so the cap no longer undercounts a
+  conversation that is not pure ASCII.
+
 ## [2.0.1]
 
 ### Fixed
