@@ -42,8 +42,16 @@ check() {
 # Count the events of one type in a log. jq prints a whole object when the
 # filter has no output expression, and an object spans several lines, so
 # counting with `jq ... | wc -l` counts lines of *text* rather than events.
+#
+# A log that is being appended to has a half-written line, and jq reports that
+# and still prints its answer, so the number is taken from the first line and
+# checked: a second line here would be the `|| 0` fallback after a successful
+# print, and the caller's arithmetic would choke on the pair.
 event_count() {
-  jq -s --arg type "${2:-}" 'map(select(.t == $type)) | length' "$1" 2>/dev/null || echo 0
+  local n
+  n=$(jq -s --arg type "${2:-}" 'map(select(.t == $type)) | length' "$1" 2>/dev/null | head -1)
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s' "$n"
 }
 
 # A run is a detached worker writing a file, so every test that waits for one
@@ -80,7 +88,10 @@ EOF
 }
 
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+# A second root for the tests that need state directories of their own: `complete`
+# is compared against an exact listing of $TMP, so nothing else may land in it.
+ALT=$(mktemp -d)
+trap 'rm -rf "$TMP" "$ALT"' EXIT
 
 AGENTTALK_STATE_DIR="$TMP/state"
 STUB="$TMP/opencode"
@@ -105,6 +116,8 @@ check "init creates the agent directory" \
   "$([[ -d "$AGENTTALK_STATE_DIR/agents/build" ]] && echo yes)" "yes"
 check "init creates an empty event log" \
   "$([[ -f "$AGENTTALK_STATE_DIR/agents/build/events.jsonl" ]] && echo yes)" "yes"
+check "init creates the panel log the panel watches" \
+  "$([[ -f "$AGENTTALK_STATE_DIR/agents/build/panel.jsonl" ]] && echo yes)" "yes"
 check "init creates meta.json" \
   "$(jq -r '.agent' "$AGENTTALK_STATE_DIR/agents/build/meta.json")" "build"
 check "init is idempotent" \
@@ -117,10 +130,67 @@ AGENTTALK_OPENCODE_BIN="$STUB" "$AGENTTALK" append build \
 check "append writes the event verbatim" \
   "$(tail -1 "$AGENTTALK_STATE_DIR/agents/build/events.jsonl")" \
   '{"t":"text","text":"hello"}'
+check "append reaches the panel log too" \
+  "$(tail -1 "$AGENTTALK_STATE_DIR/agents/build/panel.jsonl")" \
+  '{"t":"text","text":"hello"}'
+
+# --- the panel log is bounded ------------------------------------------------
+#
+# The panel watches panel.jsonl with a FileView, which reads the whole file it
+# is given. events.jsonl grows forever, so watching it means reading a whole
+# conversation to render a window that is never that big. These tests pin the
+# bound: small caps, many events, and the complete log still complete.
+
+BOUND_STATE="$ALT/state3"
+AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$BOUND_STATE" \
+  AGENTTALK_PANEL_LOG_MAX=2000 AGENTTALK_PANEL_LOG_KEEP=1000 \
+  "$AGENTTALK" init bound >/dev/null 2>&1
+for i in $(seq 1 60); do
+  AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$BOUND_STATE" \
+    AGENTTALK_PANEL_LOG_MAX=2000 AGENTTALK_PANEL_LOG_KEEP=1000 \
+    "$AGENTTALK" append bound \
+    "{\"t\":\"text\",\"text\":\"event number $i padded out with some words to make it long enough to matter\"}" \
+    >/dev/null 2>&1
+done
+check "the panel log stays under its cap" \
+  "$([[ "$(stat -c%s "$BOUND_STATE/agents/bound/panel.jsonl")" -le 2000 ]] && echo yes)" "yes"
+check "the panel log has dropped the oldest events" \
+  "$(jq -r '.text' "$BOUND_STATE/agents/bound/panel.jsonl" | grep -c '^event number 1 padded')" "0"
+check "the panel log kept a whole number of events" \
+  "$([[ "$(jq -s 'length' "$BOUND_STATE/agents/bound/panel.jsonl")" -gt 5 ]] && echo yes)" "yes"
+check "the complete log kept every event" \
+  "$(wc -l <"$BOUND_STATE/agents/bound/events.jsonl" | tr -d ' ')" "60"
+check "the panel log is shorter than the complete log" \
+  "$([[ "$(stat -c%s "$BOUND_STATE/agents/bound/panel.jsonl")" -lt \
+      "$(stat -c%s "$BOUND_STATE/agents/bound/events.jsonl")" ]] && echo yes)" "yes"
+check "the panel log keeps the newest event" \
+  "$(tail -1 "$BOUND_STATE/agents/bound/panel.jsonl" | jq -r '.text')" \
+  "event number 60 padded out with some words to make it long enough to matter"
+check "the panel log has no half-written line" \
+  "$(jq -s 'length' "$BOUND_STATE/agents/bound/panel.jsonl")" \
+  "$(wc -l <"$BOUND_STATE/agents/bound/panel.jsonl" | tr -d ' ')"
+
+# One event too big for the cap on its own, which is what a run that reads a
+# large file produces. Wherever the log was, this crosses the cap and trims, so
+# the size afterwards is the keep size and not a function of luck.
+BIG=$(printf 'x%.0s' $(seq 1 1500))
+AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$BOUND_STATE" \
+  AGENTTALK_PANEL_LOG_MAX=2000 AGENTTALK_PANEL_LOG_KEEP=1000 \
+  "$AGENTTALK" append bound "$(jq -nc --arg t "$BIG" '{t: "text", text: $t}')" \
+  >/dev/null 2>&1
+check "an event bigger than the keep size does not blank the panel" \
+  "$(jq -r 'select(.text|startswith("xxx")) | .text | length' \
+      "$BOUND_STATE/agents/bound/panel.jsonl")" "1500"
+check "the panel log is still under the cap after one big event" \
+  "$([[ "$(stat -c%s "$BOUND_STATE/agents/bound/panel.jsonl")" -le 2000 ]] && echo yes)" "yes"
+check "the big event is in the complete log too" \
+  "$(jq -r 'select(.text|startswith("xxx")) | .text | length' \
+      "$BOUND_STATE/agents/bound/events.jsonl")" "1500"
 
 # --- run --------------------------------------------------------------------
 
-AGENTTALK_OPENCODE_BIN="$STUB" "$AGENTTALK" run build "do the thing" --dir "$TMP" >/dev/null 2>&1
+printf 'do the thing' | AGENTTALK_OPENCODE_BIN="$STUB" \
+  "$AGENTTALK" run build --dir "$TMP" >/dev/null 2>&1
 events="$AGENTTALK_STATE_DIR/agents/build/events.jsonl"
 wait_for_event "$events" done 1
 
@@ -146,6 +216,55 @@ check "run stores the session for the next turn" \
 # so a run that worked has to leave it empty.
 check "a run that worked leaves the worker log empty" \
   "$([[ ! -s "$AGENTTALK_STATE_DIR/agents/build/worker.log" ]] && echo empty)" "empty"
+
+# --- the prompt travels on stdin ---------------------------------------------
+#
+# A task, or a stack trace somebody could not show anyone, is the most private
+# thing this plugin ever handles. argv is world readable, so a prompt in it
+# would sit in any user's `ps` for the length of the run. These tests watch what
+# opencode actually receives: a stub that records its own argv and its stdin.
+
+make_recording_stub() {
+  local stub="$1" record="$2"
+  cat >"$stub" <<EOF
+#!/usr/bin/env bash
+[[ "\${1:-}" == "--version" ]] && { echo "0.0.0-stub"; exit 0; }
+{
+  printf 'argv=%s\n' "\$*"
+  printf 'stdin='
+  cat
+} >"$record"
+printf '%s\n' '{"type":"session","sessionID":"ses_stub"}'
+printf '%s\n' '{"type":"done"}'
+EOF
+  chmod +x "$stub"
+}
+
+SECRET="the vault code is hunter2 and the token is sk-not-a-real-one"
+REC_STUB="$ALT/opencode-record"
+RECORD="$ALT/record.txt"
+REC_STATE="$ALT/state4"
+make_recording_stub "$REC_STUB" "$RECORD"
+printf '%s' "$SECRET" | AGENTTALK_OPENCODE_BIN="$REC_STUB" AGENTTALK_STATE_DIR="$REC_STATE" \
+  "$AGENTTALK" run build --dir "$TMP" >/dev/null 2>&1
+wait_for_event "$REC_STATE/agents/build/events.jsonl" done 1
+# The prompt is everything from the `stdin=` marker on, and a prompt can be more
+# than one line, so the marker goes and everything after it stays.
+recorded_stdin() { sed -n '/^stdin=/,$p' "$1" | sed '1s/^stdin=//'; }
+check "opencode is given the prompt on stdin" \
+  "$(recorded_stdin "$RECORD")" "$SECRET"
+check "opencode's argv holds none of the prompt" \
+  "$(grep '^argv=' "$RECORD" | grep -cF "$SECRET")" "0"
+check "opencode's argv is only flags" \
+  "$(grep '^argv=' "$RECORD" | grep -c 'hunter2')" "0"
+check "the transcript still records the prompt" \
+  "$(jq -r 'select(.t=="user") | .text' "$REC_STATE/agents/build/events.jsonl")" "$SECRET"
+printf 'line one\nline two\n' | AGENTTALK_OPENCODE_BIN="$REC_STUB" \
+  AGENTTALK_STATE_DIR="$ALT/state5" "$AGENTTALK" run build --dir "$TMP" >/dev/null 2>&1
+wait_for_event "$ALT/state5/agents/build/events.jsonl" done 1
+check "a multiline prompt survives the trip" \
+  "$(recorded_stdin "$RECORD")" "line one
+line two"
 
 # --- cd ---------------------------------------------------------------------
 
@@ -272,7 +391,7 @@ check "cd still says no such directory for a path that is not there" \
 # is the whole point of pinning it: the run happens where the user said, not
 # where a window happened to be.
 AGENTTALK_OPENCODE_BIN="$STUB" "$AGENTTALK" cd build "$TMP/project" >/dev/null 2>&1
-AGENTTALK_OPENCODE_BIN="$STUB" "$AGENTTALK" run build "again" >/dev/null 2>&1
+printf 'again' | AGENTTALK_OPENCODE_BIN="$STUB" "$AGENTTALK" run build >/dev/null 2>&1
 wait_for_event "$events" user 2
 wait_for_event "$events" done 2
 check "a run without --dir uses the pinned workdir" \
@@ -304,12 +423,23 @@ check "the pin can still be reset after a clear" \
 # --- failures ---------------------------------------------------------------
 
 check "run without an agent fails" \
-  "$(AGENTTALK_OPENCODE_BIN="$STUB" "$AGENTTALK" run "" "hi" >/dev/null 2>&1; echo $?)" "1"
+  "$(printf 'hi' | AGENTTALK_OPENCODE_BIN="$STUB" "$AGENTTALK" run "" >/dev/null 2>&1; echo $?)" "1"
 check "run without a prompt fails" \
-  "$(AGENTTALK_OPENCODE_BIN="$STUB" "$AGENTTALK" run build "" >/dev/null 2>&1; echo $?)" "1"
+  "$(printf '' | AGENTTALK_OPENCODE_BIN="$STUB" "$AGENTTALK" run build >/dev/null 2>&1; echo $?)" "1"
+check "run with only whitespace as a prompt fails" \
+  "$(printf '   \n  ' | AGENTTALK_OPENCODE_BIN="$STUB" \
+      "$AGENTTALK" run build >/dev/null 2>&1; echo $?)" "1"
+check "run with nothing on stdin at all fails" \
+  "$(AGENTTALK_OPENCODE_BIN="$STUB" "$AGENTTALK" run build </dev/null >/dev/null 2>&1; echo $?)" "1"
+check "a prompt given as an argument is not read as one" \
+  "$(AGENTTALK_OPENCODE_BIN="$STUB" "$AGENTTALK" run build "hi" </dev/null 2>&1 \
+      | grep -c "needs a prompt on stdin")" "1"
+check "a plain run complains about nothing" \
+  "$(printf 'hi' | AGENTTALK_OPENCODE_BIN="$TMP/nope" AGENTTALK_STATE_DIR="$ALT/state6" \
+      "$AGENTTALK" run build 2>&1 | grep -c "unknown option")" "0"
 check "a missing opencode is reported" \
-  "$(AGENTTALK_OPENCODE_BIN="$TMP/nope" AGENTTALK_STATE_DIR="$TMP/state2" \
-      "$AGENTTALK" run build "hi" 2>&1 | grep -c "not found")" "1"
+  "$(printf 'hi' | AGENTTALK_OPENCODE_BIN="$TMP/nope" AGENTTALK_STATE_DIR="$TMP/state2" \
+      "$AGENTTALK" run build 2>&1 | grep -c "not found")" "1"
 check "doctor survives a missing opencode" \
   "$(AGENTTALK_OPENCODE_BIN="$TMP/nope" AGENTTALK_STATE_DIR="$TMP/state2" \
       "$AGENTTALK" doctor >/dev/null 2>&1; echo $?)" "0"

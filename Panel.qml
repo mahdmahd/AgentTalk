@@ -327,10 +327,14 @@ Panel {
     editor.text = ""
     markRead(selectedId)
 
-    var args = ["run", selectedId, text]
+    // The prompt goes in over stdin and never in argv. argv is world readable,
+    // so a pasted stack trace would sit in every `ps` on the machine for as long
+    // as the run took, and this panel is the one place people paste the thing
+    // they cannot show anyone.
+    var args = ["run", selectedId]
     if (autoApprove) args.push("--auto")
     if (configuredWorkDir !== "") args.push("--dir", configuredWorkDir)
-    report(args)
+    startRun(args, text)
   }
 
   function stopRun() {
@@ -475,6 +479,17 @@ Panel {
     actionProcess.running = true
   }
 
+  // `run` gets a process of its own because it is the one command with
+  // something to say on stdin, and a prompt that went out on the shared
+  // actionProcess would be at the mercy of whatever else that process was last
+  // asked to do.
+  function startRun(args, prompt) {
+    if (runProcess.running) return
+    runProcess.command = [cli].concat(args)
+    runProcess.prompt = prompt
+    runProcess.running = true
+  }
+
   // Quickshell's StdioCollector does not reliably emit streamFinished here, so
   // nothing waits on that signal: every Process reads its collectors in
   // onExited instead, one callLater tick after the process is gone so the
@@ -552,15 +567,35 @@ Panel {
       actionProcess.onOk = null
       actionProcess.onFail = null
       root.collect(actionProcess, code, function(out) {
-        // `run` detaches and prints its session id; that is progress, not a
-        // failure, and the transcript shows it anyway. Every other command is
-        // quiet on success, so anything it prints is worth surfacing.
-        if (out !== "" && actionProcess.subcommand !== "run") root.flash(out)
+        // Every command on this process is quiet on success, so anything it
+        // prints is worth surfacing.
+        if (out !== "") root.flash(out)
         if (ok) ok(out)
       }, fail)
     }
-    // command[0] is the script itself, so the subcommand sits at index 1.
-    property string subcommand: command.length > 1 ? command[1] : ""
+  }
+
+  Process {
+    id: runProcess
+    command: [root.cli]
+    running: false
+    // The prompt waits here only until the process is up and it has been
+    // written, then goes: a QML object holding the user's last question is one
+    // more copy of it than this needs to keep.
+    property string prompt: ""
+    stdinEnabled: true
+    onStarted: {
+      write(prompt)
+      prompt = ""
+    }
+    property var stdoutCollector: StdioCollector { waitForEnd: true }
+    property var stderrCollector: StdioCollector { waitForEnd: true }
+    stdout: stdoutCollector
+    stderr: stderrCollector
+    // `run` detaches and exits as soon as the worker is away, so its stdout is
+    // progress (a session id) that the transcript already shows. A non-zero exit
+    // is still worth saying out loud, and that is what collect() does.
+    onExited: function(code) { root.collect(runProcess, code, function() {}) }
   }
 
   Timer {

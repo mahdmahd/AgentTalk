@@ -97,8 +97,13 @@ Item {
     onFileChanged: reload()
   }
 
+  // `panel.jsonl`, not `events.jsonl`. A FileView reads the whole file it is
+  // given, and events.jsonl is the complete conversation, which grows with
+  // every run and never shrinks. The script keeps panel.jsonl to its last
+  // 256 KiB, so this read is bounded by construction no matter how long the
+  // conversation gets. events.jsonl still has everything.
   FileView {
-    path: root.valid ? root.dir + "/events.jsonl" : ""
+    path: root.valid ? root.dir + "/panel.jsonl" : ""
     watchChanges: true
     printErrors: false
     onLoaded: root.loadEvents(text())

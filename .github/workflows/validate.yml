@@ -19,7 +19,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
 
       # qmllint needs Omarchy's qs.Commons/qs.Ui imports, which a plain runner
-      # does not have, so it stays a local step: see AGENTS.md.
+      # does not have, so it stays a local step: see .github/AGENTS.md.
       - name: Manifest is well formed
         run: |
           jq -e '
