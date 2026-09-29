@@ -60,6 +60,22 @@ PANEL_LOG_KEEP="${AGENTTALK_PANEL_LOG_KEEP:-131072}"
 
 log() { printf 'agenttalk: %s\n' "$*" >&2; }
 
+# A file the panel watches must never be readable half-written. `> file`
+# truncates before the first byte of the new content lands, so anything reading
+# in between gets an empty file, and jq on an empty file answers nothing at all
+# — which is how a run's pinned workspace goes missing for no reason. Write
+# beside it and rename: rename(2) within a directory is atomic, so a reader gets
+# the old content or the new one and never neither.
+write_atomic() {
+  local path="$1" tmp
+  tmp=$(mktemp "${path}.XXXXXX") || return 1
+  if ! cat >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$path"
+}
+
 agent_dir() {
   local id="${1:-}"
   if [[ -z "$id" || "$id" == *"/"* || "$id" == "." || "$id" == ".." ]]; then
@@ -353,8 +369,7 @@ cmd_cd() {
 
   jq -c --argjson pinned "$pinned" --arg workdir "$resolved" \
     '.workdirPinned = $pinned | .workdir = $workdir' \
-    "$dir/meta.json" >"$dir/meta.json.new" || return 1
-  mv "$dir/meta.json.new" "$dir/meta.json"
+    "$dir/meta.json" | write_atomic "$dir/meta.json" || return 1
   printf '%s\n' "$resolved"
 }
 
@@ -433,7 +448,7 @@ write_meta() {
   [[ "$pinned" == "true" ]] || pinned="false"
   jq -nc --arg agent "$agent" --arg workdir "$workdir" --argjson pinned "$pinned" \
     '{agent: $agent, sessionID: "", workdir: $workdir, workdirPinned: $pinned, running: false, pid: 0, exitCode: null}' \
-    >"$dir/meta.json"
+    | write_atomic "$dir/meta.json"
 }
 
 # Make sure agents have a session directory with the two files the panel
@@ -613,6 +628,10 @@ cmd_clear() {
     pinned=$(jq -r '.workdirPinned // false' "$dir/meta.json" 2>/dev/null)
   fi
   rm -f "$dir/events.jsonl" "$dir/panel.jsonl" "$dir/meta.json" "$dir/stderr.log"
+  # A worker killed between mktemp and mv leaves its half-written meta.json
+  # behind under a name nothing reads. Sweep them so the directory only ever
+  # holds what the panel looks at.
+  rm -f "$dir"/meta.json.??????
   mkdir -p "$dir"
   : >"$dir/events.jsonl"
   : >"$dir/panel.jsonl"
@@ -649,8 +668,8 @@ cmd_stop() {
   mkdir "$dir/.finalized" 2>/dev/null
   append_event "$dir" "$(jq -nc '{t: "error", text: "the run was stopped"}')"
   append_event "$dir" "$(jq -nc '{t: "done", code: 143}')"
-  jq -c '.running = false | .pid = 0 | .exitCode = 143' "$dir/meta.json" >"$dir/meta.json.tmp" \
-    && mv "$dir/meta.json.tmp" "$dir/meta.json"
+  jq -c '.running = false | .pid = 0 | .exitCode = 143' "$dir/meta.json" \
+    | write_atomic "$dir/meta.json"
   rm -f "$dir/run.pid"
   log "stopped $agent"
 }
@@ -705,7 +724,7 @@ worker() {
     append_event "$dir" "$(jq -nc '{t: "done", code: 127}')"
     jq -nc --arg agent "$agent" \
       '{agent: $agent, sessionID: "", workdir: "", workdirPinned: false, running: false, pid: 0, exitCode: 127}' \
-      >"$meta"
+      | write_atomic "$meta"
     return 127
   fi
 
@@ -724,7 +743,7 @@ worker() {
     append_event "$dir" "$(jq -nc --argjson code "$code" '{t: "done", code: $code}')"
     jq -c --argjson code "$code" --arg s "$session_id" \
       '.running = false | .pid = 0 | .exitCode = $code | .sessionID = $s' \
-      <<<"$current" >"$meta"
+      <<<"$current" | write_atomic "$meta"
     rm -f "$dir/run.pid"
   }
   trap 'finalize 143' TERM INT HUP
@@ -777,7 +796,7 @@ worker() {
   # its process group id: a group kill gets the whole run, signal handling
   # included.
   current=$(jq -c --argjson pid "$$" '.pid = $pid' <<<"$current")
-  printf '%s\n' "$current" >"$meta"
+  write_atomic "$meta" <<<"$current"
 
   local status=0
   # The subshell's own pid survives `exec`, so run.pid stays a valid handle on
@@ -808,7 +827,7 @@ worker() {
         # turn needs to continue this conversation instead of starting over.
         if [[ -z "$session_id" && "$event" == '{"t":"session"'* ]]; then
           session_id=$(jq -r '.id // ""' <<<"$event" 2>/dev/null)
-          jq -c --arg s "$session_id" '.sessionID = $s' <<<"$current" >"$meta"
+          jq -c --arg s "$session_id" '.sessionID = $s' <<<"$current" | write_atomic "$meta"
         fi
       done
   status=${PIPESTATUS[0]}
@@ -899,28 +918,38 @@ cmd_run() {
 
 # ------------------------------------------------------------------- main
 
-case "${1:-}" in
-  agents) shift; cmd_agents "$@" ;;
-  doctor) shift; cmd_doctor "$@" ;;
-  init) shift; cmd_init "$@" ;;
-  append) shift; cmd_append "$@" ;;
-  run) shift; cmd_run "$@" ;;
-  clear) shift; cmd_clear "${1:-}" ;;
-  stop) shift; cmd_stop "${1:-}" ;;
-  cwd) shift; cmd_cwd "$@" ;;
-  cd) shift; cmd_cd "$@" ;;
-  complete) shift; cmd_complete "$@" ;;
-  state-dir) printf '%s\n' "$STATE_DIR" ;;
-  bind) shift; cmd_bind "$@" ;;
-  unbind) shift; cmd_unbind "$@" ;;
-  --worker)
-    shift
-    worker "$@"
-    ;;
-  *)
-    # The header comment is the manual: print every line of it, whatever its
-    # length, rather than a line range that goes stale on the next edit.
-    awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
-    exit 1
-    ;;
-esac
+main() {
+  case "${1:-}" in
+    agents) shift; cmd_agents "$@" ;;
+    doctor) shift; cmd_doctor "$@" ;;
+    init) shift; cmd_init "$@" ;;
+    append) shift; cmd_append "$@" ;;
+    run) shift; cmd_run "$@" ;;
+    clear) shift; cmd_clear "${1:-}" ;;
+    stop) shift; cmd_stop "${1:-}" ;;
+    cwd) shift; cmd_cwd "$@" ;;
+    cd) shift; cmd_cd "$@" ;;
+    complete) shift; cmd_complete "$@" ;;
+    state-dir) printf '%s\n' "$STATE_DIR" ;;
+    bind) shift; cmd_bind "$@" ;;
+    unbind) shift; cmd_unbind "$@" ;;
+    --worker)
+      shift
+      worker "$@"
+      ;;
+    *)
+      # The header comment is the manual: print every line of it, whatever its
+      # length, rather than a line range that goes stale on the next edit.
+      awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
+      exit 1
+      ;;
+  esac
+}
+
+# Sourcing this file reaches the helpers without running a command. The tests
+# need `write_atomic` on its own, because what it guarantees is what a reader
+# sees at the instant of the write, and that is not observable from outside the
+# script: a CLI this fast finishes before a caller can look.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
