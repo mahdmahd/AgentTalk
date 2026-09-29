@@ -4,6 +4,12 @@ Working rules for this repository. Read this before changing anything: most of
 it is not a matter of taste, it is what keeps the plugin installable, reviewable
 and publishable.
 
+This file lives in `.github/`, not in the repository root, and that is not a
+matter of taste either. The plugin is installed by cloning this repository, so
+everything in the root ends up in a user's plugin folder — and a root
+`AGENTS.md` is a file coding agents pick up and obey without anyone asking
+them to. Read it from here; do not move it up.
+
 ## What this project is
 
 An Omarchy shell plugin: a bar widget (`BarWidget.qml`, `Panel.qml`,
@@ -37,16 +43,16 @@ rules at <https://github.com/omacom/omarchy-plugin-marketplace>.
 
 ## Git workflow
 
-- **`main` is the trunk.** It is never edited directly, and nothing is ever
+- **`trunk` is the trunk.** It is never edited directly, and nothing is ever
   pushed to it except through a pull request.
-- Every change starts from an up-to-date `main` on its own branch:
+- Every change starts from an up-to-date `trunk` on its own branch:
   ```bash
   git fetch origin
-  git switch main && git pull --ff-only
+  git switch trunk && git pull --ff-only origin trunk
   git switch -c <type>/<what-it-does>      # feat/, fix/, docs/, chore/, refactor/
   ```
-- Work goes up as a **pull request to `main`**. That is mandatory for every
-  change, including one-line fixes: no direct commits on `main`, no force
+- Work goes up as a **pull request to `trunk`**. That is mandatory for every
+  change, including one-line fixes: no direct commits on `trunk`, no force
   pushes, no rewriting trunk history.
 - Branch names say what the change does, not who did it. One concern per branch;
   unrelated changes split into separate branches and separate pull requests.

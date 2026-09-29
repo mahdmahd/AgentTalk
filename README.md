@@ -194,9 +194,18 @@ state directory, `agenttalk state-dir` prints it:
 
 ```
 $STATE/agents/<agent>/meta.json     session id, workdir, pid, exit code
-$STATE/agents/<agent>/events.jsonl  one normalised event per line
+$STATE/agents/<agent>/events.jsonl  one normalised event per line, the whole
+                                    conversation, never trimmed
+$STATE/agents/<agent>/panel.jsonl   the tail of that log, capped in bytes, and
+                                    the only one the panel ever reads
 $STATE/agents/<agent>/stderr.log    raw stderr of the last run
 ```
+
+Two logs, on purpose. The panel reads its state with `FileView`, which reads
+the whole file it is pointed at, and a conversation that has run all afternoon
+is bigger than any transcript window. `panel.jsonl` is that log's last 256 KiB,
+which bounds what the panel loads however long the conversation gets;
+`events.jsonl` still holds every event, if you want to read one with `jq`.
 
 Events are normalised to a handful of shapes — `user`, `text`, `tool`, `error`,
 `session`, `done` — so the panel never has to know opencode's internals. It
@@ -210,9 +219,9 @@ something looks wrong:
 
 ```bash
 agenttalk agents                        # agents as JSON
-agenttalk run build "add a test"        # start a turn
-agenttalk run build "add a test" --dir ~/Code/project
-agenttalk run build "add a test" --new  # new session instead of this one
+agenttalk run build < "add a test"      # start a turn, prompt on stdin
+agenttalk run build --dir ~/Code/project < "add a test"
+agenttalk run build --new < "add a test"  # new session instead of this one
 agenttalk stop build                    # stop it
 agenttalk clear build                   # forget the conversation, keep the workspace
 agenttalk cwd                           # working directory of the focused window
@@ -231,9 +240,18 @@ agent's session unless `--new` says otherwise, and one agent runs at a time: a
 second `run` for an agent that is already working is refused rather than fought
 over.
 
+The prompt goes in on stdin, never as an argument, and that is the only way
+`run` takes it. Process arguments are readable by any user on the machine while
+the process lives, so a prompt there would put whatever you typed — a bug
+report, a token, the name of a customer — into every `ps` for the length of the
+run. A pipe is nobody else's business. The script hands the same prompt to
+opencode the same way, and while a run is in flight it is also in one private
+temporary file under the agent's own directory, which the worker deletes when
+the run ends.
+
 `complete` and `init` are what the panel calls underneath: the listing under the
-workspace field, and the check that an agent's session directory and its two
-files exist before anything tries to read them. Neither is something you need to
+workspace field, and the check that an agent's session directory and its files
+exist before anything tries to read them. Neither is something you need to
 run by hand.
 
 `cd` is what the `WORKSPACE` row calls, and it is the one to reach for when the
@@ -249,6 +267,8 @@ What the script reads from the environment:
 | `AGENTTALK_OPENCODE_BIN` | opencode binary to use, in place of the search above |
 | `AGENTTALK_STATE_DIR` | state directory override |
 | `AGENTTALK_TIMEOUT` | seconds before a run is killed (default `3600`) |
+| `AGENTTALK_PANEL_LOG_MAX` | bytes `panel.jsonl` may reach before it is trimmed (default `262144`) |
+| `AGENTTALK_PANEL_LOG_KEEP` | bytes kept when it is trimmed (default `131072`) |
 | `HYPRLAND_CONFIG_DIR` | Hyprland config directory (default `~/.config/hypr`) |
 | `XDG_STATE_HOME` | parent of the state directory when `AGENTTALK_STATE_DIR` is unset |
 
@@ -306,8 +326,11 @@ bash tools/test.sh                     # behaviour tests for the script and Mode
 `qmllint` needs the `qs.*` imports that only exist in an Omarchy install, so it
 runs on your machine rather than in CI. The workflow checks the manifest, that
 both shell scripts parse, `tools/svg2qml.py`, `tools/test.sh` and that the
-changelog has an `## [Unreleased]` section. See [AGENTS.md](AGENTS.md) for the
-rules this repository is worked under.
+changelog has an `## [Unreleased]` section. See
+[.github/AGENTS.md](.github/AGENTS.md) for the rules this repository is worked
+under. It lives in `.github/` on purpose: the plugin is installed by cloning
+this repository, so anything in the root ships to every user, and a root
+`AGENTS.md` is a file that coding agents read on their own.
 
 ## License
 

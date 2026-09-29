@@ -11,15 +11,23 @@
 #
 #   $STATE/agents/<agent>/meta.json     session id, workdir, pid, exit code,
 #                                       and whether the workdir was chosen
-#   $STATE/agents/<agent>/events.jsonl  one normalized event per line
+#   $STATE/agents/<agent>/events.jsonl  one normalized event per line, forever
+#   $STATE/agents/<agent>/panel.jsonl   the tail of that log, capped in bytes,
+#                                       and the only one the panel ever reads
 #   $STATE/agents/<agent>/stderr.log    raw stderr of the last run
+#
+# Two logs, on purpose. The panel wants a bounded amount of text, and a FileView
+# reads the whole file it is given, so watching the complete log means a long
+# conversation is read in full over and over to render a window that was never
+# going to be that big. events.jsonl stays complete; panel.jsonl is the part
+# the panel is allowed to have.
 #
 # Subcommands:
 #   agents                        list agents as JSON
 #   doctor                        report what this script can find (opencode, state)
 #   init <agent...>               make sure session files exist
 #   append <agent> <json>         append one event to an agent's log
-#   run <agent> <prompt>          start a turn (detached)
+#   run <agent> [options]         start a turn from a prompt on stdin (detached)
 #   cd <agent> <dir|--window|--reset>  choose where that agent works
 #   complete [dir-prefix] [stem]       list directories for Tab completion
 #   clear <agent>                 forget the conversation
@@ -43,6 +51,13 @@ OPENCODE_BIN="${AGENTTALK_OPENCODE_BIN:-opencode}"
 RUN_TIMEOUT="${AGENTTALK_TIMEOUT:-3600}"
 HYPR_DIR="${HYPRLAND_CONFIG_DIR:-$HOME/.config/hypr}"
 
+# How much of the log the panel is given, and how much is kept when it is given
+# too much. Halving on every trim keeps the file from crossing the cap again
+# immediately, and a panel that loses the oldest half of a very long
+# conversation is showing the part the user is actually reading.
+PANEL_LOG_MAX="${AGENTTALK_PANEL_LOG_MAX:-262144}"
+PANEL_LOG_KEEP="${AGENTTALK_PANEL_LOG_KEEP:-131072}"
+
 log() { printf 'agenttalk: %s\n' "$*" >&2; }
 
 agent_dir() {
@@ -52,6 +67,58 @@ agent_dir() {
     return 1
   fi
   printf '%s/agents/%s' "$STATE_DIR" "$id"
+}
+
+# How many bytes the panel's view of a log holds, from the file itself. A worker
+# tracks its own count as it goes, but anything that appends from outside one
+# (the `append` subcommand, `stop`) has no counter to keep.
+panel_log_size() {
+  local panel="$1"
+  [[ -f "$panel" ]] || { printf '0'; return 0; }
+  stat -c%s "$panel" 2>/dev/null || printf '0'
+}
+
+# Cut the panel's log back to its last PANEL_LOG_KEEP bytes. The first line of a
+# byte-tail is half a line, and the panel already skips a line it cannot parse,
+# so dropping it costs nothing and keeps every line that is left complete.
+#
+# When that leaves nothing, the newest event is larger than the window, and
+# dropping the whole transcript until the next event is worse than keeping more
+# of it: widen the window, never past the cap. A single event bigger than the cap
+# itself cannot be shown whole, and that is the one case where the panel log
+# legitimately ends up holding nothing usable.
+trim_panel_log() {
+  local panel="$1" tmp keep="$PANEL_LOG_KEEP"
+  tmp=$(mktemp "$panel.trim.XXXXXX") || return 1
+  if ! tail -c "$keep" "$panel" | sed 1d >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  while [[ ! -s "$tmp" ]] && ((keep < PANEL_LOG_MAX)); do
+    keep=$((keep * 2))
+    tail -c "$keep" "$panel" | sed 1d >"$tmp"
+  done
+  mv "$tmp" "$panel"
+}
+
+# Append one event to the complete log and to the panel's bounded view of it.
+# `bytes` is the caller's running count of the view: the worker has one and keeps
+# it as it goes, and a caller with no counter gets the size from the file, which
+# is one stat on a path that is not hot.
+append_event() {
+  local dir="$1" event="$2" bytes="${3:-}" panel="$dir/panel.jsonl"
+  printf '%s\n' "$event" >>"$dir/events.jsonl"
+  printf '%s\n' "$event" >>"$panel"
+  if [[ -n "$bytes" ]]; then
+    bytes=$((bytes + ${#event} + 1))
+  else
+    bytes=$(panel_log_size "$panel")
+  fi
+  if ((bytes > PANEL_LOG_MAX)); then
+    trim_panel_log "$panel" || return 0
+    bytes=$(panel_log_size "$panel")
+  fi
+  printf '%s' "$bytes"
 }
 
 # `~` and a relative path are typed by humans; the panel and the event log want
@@ -222,7 +289,7 @@ cmd_append() {
   mkdir -p "$dir" || return 1
   # A single small line, appended with >> : the worker appends the same way,
   # so the only thing that matters is that a line never lands in two pieces.
-  printf '%s\n' "$line" >>"$dir/events.jsonl"
+  append_event "$dir" "$line"
 }
 
 # ------------------------------------------------------------------- cwd
@@ -377,6 +444,7 @@ cmd_init() {
     dir=$(agent_dir "$id") || return 1
     mkdir -p "$dir" || return 1
   [[ -f "$dir/events.jsonl" ]] || : >"$dir/events.jsonl"
+  [[ -f "$dir/panel.jsonl" ]] || : >"$dir/panel.jsonl"
   [[ -f "$dir/meta.json" ]] && continue
   write_meta "$dir" "$id"
 done
@@ -544,9 +612,10 @@ cmd_clear() {
     workdir=$(jq -r '.workdir // ""' "$dir/meta.json" 2>/dev/null)
     pinned=$(jq -r '.workdirPinned // false' "$dir/meta.json" 2>/dev/null)
   fi
-  rm -f "$dir/events.jsonl" "$dir/meta.json" "$dir/stderr.log"
+  rm -f "$dir/events.jsonl" "$dir/panel.jsonl" "$dir/meta.json" "$dir/stderr.log"
   mkdir -p "$dir"
   : >"$dir/events.jsonl"
+  : >"$dir/panel.jsonl"
   write_meta "$dir" "${1:-}" "$workdir" "$pinned"
 }
 
@@ -578,8 +647,8 @@ cmd_stop() {
   kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
   sleep 0.3
   mkdir "$dir/.finalized" 2>/dev/null
-  jq -nc '{t: "error", text: "the run was stopped"}' >>"$dir/events.jsonl"
-  jq -nc '{t: "done", code: 143}' >>"$dir/events.jsonl"
+  append_event "$dir" "$(jq -nc '{t: "error", text: "the run was stopped"}')"
+  append_event "$dir" "$(jq -nc '{t: "done", code: 143}')"
   jq -c '.running = false | .pid = 0 | .exitCode = 143' "$dir/meta.json" >"$dir/meta.json.tmp" \
     && mv "$dir/meta.json.tmp" "$dir/meta.json"
   rm -f "$dir/run.pid"
@@ -618,18 +687,22 @@ normalize_stream() {
 # running.
 worker() {
   local agent="$1" prompt_file="$2" workdir="$3" auto="$4" fresh="$5"
-  local dir events meta
+  local dir events meta panel panel_bytes
   dir=$(agent_dir "$agent") || return 1
   events="$dir/events.jsonl"
   meta="$dir/meta.json"
+  panel="$dir/panel.jsonl"
   mkdir -p "$dir"
   touch "$events"
+  # The count starts from the file, so a run that picks up an already long
+  # conversation trims on its first event instead of waiting for its own.
+  panel_bytes=$(panel_log_size "$panel")
 
   # The worker is its own process, so it resolves opencode for itself: the
   # session it was spawned from may have been started from a different PATH.
   if ! resolve_opencode; then
-    jq -nc --arg t "$OPENCODE_BIN not found" '{t: "error", text: $t}' >>"$events"
-    jq -nc '{t: "done", code: 127}' >>"$events"
+    append_event "$dir" "$(jq -nc --arg t "$OPENCODE_BIN not found" '{t: "error", text: $t}')"
+    append_event "$dir" "$(jq -nc '{t: "done", code: 127}')"
     jq -nc --arg agent "$agent" \
       '{agent: $agent, sessionID: "", workdir: "", workdirPinned: false, running: false, pid: 0, exitCode: 127}' \
       >"$meta"
@@ -645,10 +718,10 @@ worker() {
     local code="$1"
     mkdir "$lock" 2>/dev/null || return 0
     if [[ "$code" == "124" ]]; then
-      jq -nc --arg t "the run exceeded ${RUN_TIMEOUT}s and was stopped" \
-        '{t: "error", text: $t}' >>"$events"
+      append_event "$dir" "$(jq -nc --arg t "the run exceeded ${RUN_TIMEOUT}s and was stopped" \
+        '{t: "error", text: $t}')"
     fi
-    jq -nc --argjson code "$code" '{t: "done", code: $code}' >>"$events"
+    append_event "$dir" "$(jq -nc --argjson code "$code" '{t: "done", code: $code}')"
     jq -c --argjson code "$code" --arg s "$session_id" \
       '.running = false | .pid = 0 | .exitCode = $code | .sessionID = $s' \
       <<<"$current" >"$meta"
@@ -675,8 +748,11 @@ worker() {
   # repeats the prompt. The workdir travels with it: a transcript read days
   # later has to say which tree each question was asked in, because the panel's
   # header only ever shows the current one.
-  jq -nc --arg text "$prompt" --arg workdir "$workdir" \
-    '{t: "user", text: $text, workdir: $workdir}' >>"$events"
+  #
+  # `env`, not `--arg`: an environment is readable only by its owner, while
+  # argv is world readable, and this is the user's own words.
+  append_event "$dir" "$(AGENTTALK_TEXT="$prompt" jq -nc --arg workdir "$workdir" \
+    '{t: "user", text: env.AGENTTALK_TEXT, workdir: $workdir}')"
 
   # The workdir the user picked in the panel outlives this run, so it is read
   # before meta.json is rebuilt rather than after.
@@ -711,11 +787,23 @@ worker() {
   (
     cd "$workdir" || exit 1
     printf '%s\n' "$BASHPID" >"$dir/run.pid"
-    exec timeout --kill-after=10 "$RUN_TIMEOUT" "$RESOLVED_OPENCODE" "${args[@]}" "$prompt"
-  ) 2>"$dir/stderr.log" </dev/null \
+    # opencode reads the message from stdin when it gets no positional, and a
+    # pipe is not in any process list. `< <(...)` keeps the `exec` that makes
+    # the subshell's pid a valid handle on this run.
+    exec timeout --kill-after=10 "$RUN_TIMEOUT" "$RESOLVED_OPENCODE" "${args[@]}" \
+      < <(printf '%s' "$prompt")
+  ) 2>"$dir/stderr.log" \
     | normalize_stream \
     | while IFS= read -r event; do
+        # Both logs, counted in the loop rather than through `append_event`: that
+        # helper returns its count, and a command substitution would cost a fork
+        # on every event of every run to save a few lines of arithmetic.
         printf '%s\n' "$event" >>"$events"
+        printf '%s\n' "$event" >>"$panel"
+        panel_bytes=$((panel_bytes + ${#event} + 1))
+        if ((panel_bytes > PANEL_LOG_MAX)); then
+          if trim_panel_log "$panel"; then panel_bytes=$(panel_log_size "$panel"); fi
+        fi
         # Every raw event carries the session id. The first one is all the next
         # turn needs to continue this conversation instead of starting over.
         if [[ -z "$session_id" && "$event" == '{"t":"session"'* ]]; then
@@ -732,8 +820,10 @@ worker() {
 }
 
 cmd_run() {
-  local agent="${1:-}" prompt="${2:-}"
-  shift 2 2>/dev/null || true
+  local agent="${1:-}"
+  # Only the agent is positional now; everything after it is an option, and the
+  # prompt is not in argv at all.
+  [[ $# -gt 0 ]] && shift
   local auto="false" fresh="false" workdir=""
 
   while [[ $# -gt 0 ]]; do
@@ -748,7 +838,15 @@ cmd_run() {
   done
 
   [[ -n "$agent" ]] || { log "run needs an agent id"; return 1; }
-  [[ -n "${prompt//[[:space:]]/}" ]] || { log "run needs a prompt"; return 1; }
+
+  # The prompt arrives on stdin, not as an argument. A task or a pasted stack
+  # trace is the most private thing this plugin ever handles, and argv is world
+  # readable: anyone on the machine could read it out of `ps` for as long as the
+  # run lasted. stdin is a pipe, and a pipe is nobody else's business.
+  local prompt
+  prompt=$(cat)
+
+  [[ -n "${prompt//[[:space:]]/}" ]] || { log "run needs a prompt on stdin"; return 1; }
 
   if ! resolve_opencode; then
     log "$OPENCODE_BIN not found; install opencode or set AGENTTALK_OPENCODE_BIN"
@@ -780,9 +878,11 @@ cmd_run() {
   rm -rf "$dir/.finalized"
   rm -f "$dir/run.pid"
 
-  # The prompt goes through a file rather than argv: a pasted stack trace can
-  # be long, and this keeps it out of every `ps` on the machine while the run
-  # lasts. The worker deletes it when it is done.
+  # The prompt goes through a file rather than argv: a pasted stack trace can be
+  # long, and this keeps it out of every `ps` on the machine while the run
+  # lasts. It arrives here on stdin and leaves on stdin; the file is only how
+  # the detached worker gets it from this process to the next. The worker
+  # deletes it when it is done.
   local prompt_file
   prompt_file=$(mktemp "$dir/prompt.XXXXXX") || return 1
   printf '%s' "$prompt" >"$prompt_file"

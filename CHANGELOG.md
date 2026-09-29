@@ -7,6 +7,31 @@ the only place a version number lives.
 
 ## [Unreleased]
 
+## [2.0.0]
+
+### Changed
+
+- **Breaking:** `agenttalk run` takes the prompt on stdin, not as an argument:
+  `agenttalk run build "add a test"` is now `agenttalk run build < "add a test"`.
+  A prompt in the argument list is readable by any user on the machine for as
+  long as the process lives, so a pasted stack trace, a customer name or a token
+  sat in every `ps` until the run ended. Nothing else about `run` changed, and
+  the panel was switched over in the same release.
+- The prompt also reaches opencode over stdin instead of as its positional
+  message, and the transcript line the worker writes for it no longer passes the
+  text through `jq`'s argument list either. It travels in a pipe and in one
+  owner-only temporary file, which the worker deletes when the run ends.
+- The panel now reads `panel.jsonl`, a tail of the event log capped at 256 KiB,
+  instead of reading `events.jsonl` whole. `FileView` reads the entire file it
+  is given, so a long conversation was read in full on every change to render a
+  window that was never that big. `events.jsonl` is unchanged and still holds
+  every event. `AGENTTALK_PANEL_LOG_MAX` and `AGENTTALK_PANEL_LOG_KEEP` move the
+  cap.
+- `AGENTS.md`, the rules this repository is worked under, moved to
+  `.github/AGENTS.md`. The plugin is installed by cloning this repository, so
+  everything in the root ships to every user, and a root `AGENTS.md` is a file
+  that coding agents read and obey without being asked to.
+
 ## [1.3.0]
 
 ### Added
