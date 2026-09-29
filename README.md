@@ -10,7 +10,12 @@ keeps going while you close the panel, change your theme, or restart your shell.
 ## Requirements
 
 - [Omarchy](https://omarchy.org) with a running `omarchy-shell`
-- [opencode](https://opencode.ai) on your `PATH` (or `AGENTTALK_OPENCODE_BIN` set)
+- [opencode](https://opencode.ai). The `PATH` answers first; failing that the
+  script looks where opencode installs itself — `~/.local/bin`, `~/.opencode/bin`,
+  a mise shim, `/usr/local/bin`, `/usr/bin`, and any version mise has installed.
+  `AGENTTALK_OPENCODE_BIN` replaces that search, and a value containing a `/` is
+  taken as it stands, so a path that is wrong is an error rather than a silent
+  fall back to something else.
 
 AgentTalk does not need a build step, a runtime dependency, or a service. It is
 a bar widget plus one shell script, both of which ship inside the plugin.
@@ -21,8 +26,9 @@ a bar widget plus one shell script, both of which ship inside the plugin.
 omarchy plugin add https://github.com/ramackersjp/AgentTalk.git --enable
 ```
 
-The widget lands in the right-hand section of the bar. Move it wherever you
-like, or change what it shows:
+`--enable` asks which section the widget goes in and offers `right`, which is
+what the manifest asks for. Move it wherever you like afterwards, or change what
+it shows:
 
 ```bash
 omarchy bar move io.github.ramackersjp.agenttalk --section center
@@ -48,6 +54,8 @@ agenttalk doctor
 omarchy plugin remove io.github.ramackersjp.agenttalk
 ```
 
+It asks before it removes anything; `--yes` answers for you.
+
 Your conversations live in `~/.local/state/agenttalk` and are not touched by
 removing the plugin. Delete that directory to forget them.
 
@@ -58,9 +66,9 @@ removing the plugin. Delete that directory to forget them.
 | Open the panel | Click the bar icon, or run `omarchy-shell shell summon io.github.ramackersjp.agenttalk` |
 | Talk to an agent | Type. The prompt is focused when the panel opens; Enter sends, Shift+Enter adds a line |
 | Pick another agent | Click it on the left. The prompt keeps the keyboard, so the arrows move the caret, not the agent list |
-| Start a fresh conversation | `New`, in the header |
+| Start a fresh conversation | `New`, in the header. The workspace stays where you put it |
 | Stop a running agent | `Stop`, in the header, while the agent is working |
-| Change where the next run happens | The `WORKSPACE` row: `change…` to type a path, `window` to follow the focused window, `reset` to forget it |
+| Change where the next run happens | The `WORKSPACE` row: click the path, or `change…`, to type one; `window` to follow the focused window; `reset` to forget the pin |
 | Close the panel | Escape, or click outside it |
 
 One conversation per agent, and they are independent: a `build` run keeps going
@@ -76,27 +84,35 @@ sits in a `following the window` group until you pin a path to it.
 ### Choosing a workspace
 
 The `WORKSPACE` row is where the next run of the selected agent happens.
-`change…` turns the row into a field, and the button reads `set` while you type.
-The field then lists the **directories** its text matches, as you type, so a
-path you only half remember is on screen before you commit to it:
+Clicking the path — or `change…` — turns the row into a field, and the button
+reads `set` while you type. The field then lists the **directories** its text
+matches, as you type, so a path you only half remember is on screen before you
+commit to it:
 
 - `Up` and `Down` walk the list, and the field text follows the row you land on
 - `Enter` takes what the field says: the lit row, the only match, or the text
   itself when it already names a directory
-- `Tab` extends to the common prefix, which is what Tab does everywhere else
+- `Tab` extends to the common prefix, which is what Tab does everywhere else; on
+  a single match it fills the name and puts a `/` on the end, because that is
+  then the next thing to type
+- matching ignores case, so `agent` finds `AgentTalk`
 - the mouse wheel walks the list, and a row can be clicked
 - a trailing `/` asks what is inside a directory
 - a path that does not start at `/` is read from your home directory, because
   the panel has no directory of its own to read it from
+- a list that finds nothing says `nothing here starts with that`, which is a
+  statement about the list and not a verdict on the path
 
 `Escape` closes the list first, and leaves the field only on a second press. A
-path the script refuses stays in the field with the reason under it, so a typo
-is something you read and correct rather than something you type a second time
-to find out what was wrong with it.
+path the script refuses stays in the field with the reason under it — `not a
+directory` for a file, `no such directory` for a name that is not there — so a
+typo is something you read and correct rather than something you type a second
+time to find out what was wrong with it.
 
 ### Settings
 
-There is no settings dialog in the bar; set a value from the terminal:
+The shell renders no settings form for a bar widget, so there is nothing to
+right-click into. Set a value from the terminal:
 
 ```bash
 omarchy bar set io.github.ramackersjp.agenttalk defaultAgent plan
@@ -104,20 +120,33 @@ omarchy bar set io.github.ramackersjp.agenttalk defaultAgent plan
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `autoApprove` | `true` | Lets agents edit files and run commands without stopping for permission. Turn it off if you want to answer permission requests yourself. |
+| `autoApprove` | `true` | Auto-approves the permissions you have not explicitly denied. Turn it off and a run halts at the first one instead, until you answer it in a terminal. |
 | `defaultAgent` | *(empty)* | Agent selected when the panel opens. Empty picks `build`, then the first primary agent opencode reports, then the first one it lists. |
 | `workDir` | *(empty)* | Where agents run. Empty means "the directory of the window you are focused on". |
+
+A boolean needs `--json`, or it is stored as the text `false` and the panel goes
+on reading it as true:
+
+```bash
+omarchy bar set io.github.ramackersjp.agenttalk autoApprove false --json
+```
+
+`workDir` wins over the `WORKSPACE` row: the panel passes it to every run, so an
+agent you pinned a path for still runs there, and the whole rail moves into one
+group. Empty it to get the per-agent workspace back.
 
 ### Keybinding
 
 ```bash
 agenttalk bind SUPER CTRL A     # SUPER + CTRL + A opens the panel
 agenttalk bind                  # the default, SUPER + A
+agenttalk bind --print          # print the block instead of writing it
 agenttalk unbind                # remove it
 ```
 
 The binding is written into `~/.config/hypr/bindings.lua` as one marked block,
 so `agenttalk unbind` can take it away again and your own lines are left alone.
+Hyprland is reloaded for you, so the key works straight away.
 
 ## The icon
 
@@ -151,7 +180,8 @@ bin/agenttalk    agents, runs, process groups, JSON normalisation, keybinding
 has no privileged logic and the awkward parts (process groups, JSON
 normalisation, working-directory resolution) can be tested from a terminal. A
 run is detached and appends to an event log, which is why it survives closing
-the panel, reloading the plugin or restarting the shell:
+the panel, reloading the plugin or restarting the shell. `$STATE` below is the
+state directory, `agenttalk state-dir` prints it:
 
 ```
 $STATE/agents/<agent>/meta.json     session id, workdir, pid, exit code
@@ -173,15 +203,29 @@ something looks wrong:
 agenttalk agents                        # agents as JSON
 agenttalk run build "add a test"        # start a turn
 agenttalk run build "add a test" --dir ~/Code/project
+agenttalk run build "add a test" --new  # new session instead of this one
 agenttalk stop build                    # stop it
-agenttalk clear build                   # forget the conversation
+agenttalk clear build                   # forget the conversation, keep the workspace
 agenttalk cwd                           # working directory of the focused window
 agenttalk cd build ~/Code/project       # where that agent works from now on
 agenttalk cd build --window             # follow the focused window again
 agenttalk cd build --reset              # forget the pinned path
+agenttalk complete Code/ Age            # directories, for the workspace field
 agenttalk doctor                        # what the plugin can find
 agenttalk state-dir                     # where the conversations live
 ```
+
+`run` also takes `--auto`, which is what the `autoApprove` setting passes: it
+auto-approves the permissions you have not explicitly denied, and a run without
+it stops at the first one it has not been told about. A turn continues the
+agent's session unless `--new` says otherwise, and one agent runs at a time: a
+second `run` for an agent that is already working is refused rather than fought
+over.
+
+`complete` and `init` are what the panel calls underneath: the listing under the
+workspace field, and the check that an agent's session directory and its two
+files exist before anything tries to read them. Neither is something you need to
+run by hand.
 
 `cd` is what the `WORKSPACE` row calls, and it is the one to reach for when the
 panel and the terminal disagree about where an agent works.
@@ -189,35 +233,57 @@ panel and the terminal disagree about where an agent works.
 Without the symlink, call it by path:
 `~/.config/omarchy/plugins/io.github.ramackersjp.agenttalk/bin/agenttalk doctor`.
 
+What the script reads from the environment:
+
 | Variable | Meaning |
 | --- | --- |
-| `AGENTTALK_OPENCODE_BIN` | opencode binary to use |
+| `AGENTTALK_OPENCODE_BIN` | opencode binary to use, in place of the search above |
 | `AGENTTALK_STATE_DIR` | state directory override |
 | `AGENTTALK_TIMEOUT` | seconds before a run is killed (default `3600`) |
 | `HYPRLAND_CONFIG_DIR` | Hyprland config directory (default `~/.config/hypr`) |
+| `XDG_STATE_HOME` | parent of the state directory when `AGENTTALK_STATE_DIR` is unset |
 
 ## Troubleshooting
 
-**The panel says `No opencode agents found`.** opencode is not where AgentTalk
-is looking, or it is not installed. `agenttalk doctor` prints the path it found,
-the version it reports and whether the state directory is writable. If opencode
-lives somewhere unusual, point the script at it with
-`AGENTTALK_OPENCODE_BIN=/path/to/opencode`, or make sure `opencode` is on the
-`PATH` the shell passes to the widget.
+**The panel says `No opencode agents found`.** opencode is not installed, or it
+is somewhere the script does not look. `agenttalk doctor` prints the path it
+found, the version it reports, whether that path came from the `PATH` and
+whether the state directory is writable. The usual places are already searched,
+so if opencode lives somewhere else entirely, point the script at it:
+
+```bash
+AGENTTALK_OPENCODE_BIN=/path/to/opencode agenttalk doctor
+```
+
+A value with a `/` in it is used as it stands and nothing else is tried, so a
+wrong one is an error rather than a quiet fall back.
+
+**A setting you changed did not take.** `omarchy bar set` stores whatever you
+type as text unless you pass `--json`, so `autoApprove false` lands in
+`shell.json` as `"false"` — a string, which the panel reads as true. The fix is
+in [Settings](#settings); the symptom is a setting that looks set and is not.
 
 **The workspace list stays empty although the directory is there.** It lists
 directories, never files. A bare name is read from your home directory, so `Code`
 means `~/Code` and not wherever the panel happens to sit; `~` starts at your home
-directory too. A trailing `/` asks what is inside a directory, and a leading dot
-brings the hidden ones into the list.
+directory too. A trailing `/` asks what is inside a directory, a leading dot
+brings the hidden ones into the list, and matching ignores case — `agent` finds
+`AgentTalk`, but neither finds a file.
+
+**A long transcript starts halfway through.** The panel draws the last 400
+blocks of a conversation and says how many messages it left out, so an old
+conversation does not have to be read to be useless. `agenttalk clear` starts a
+new one.
 
 **A run takes a long time to say anything.** opencode snapshots the working
 directory before its first turn, and that is slow in a large directory. If the
 focused window is your home directory, set `workDir` to the project you are
 actually working on.
 
-**The panel is empty after editing the plugin.** `omarchy-restart-shell`. Hot
-reload does not always reinstantiate a bar widget that is already mounted.
+**The panel is empty after editing the plugin.** `omarchy-restart-shell`. The
+shell rescans `~/.config/omarchy/plugins/` when something in it changes, but a
+bar widget that is already mounted is not always reinstantiated, so the restart
+is what you can rely on.
 
 ## Development
 
@@ -229,8 +295,10 @@ bash tools/test.sh                     # behaviour tests for the script and Mode
 ```
 
 `qmllint` needs the `qs.*` imports that only exist in an Omarchy install, so it
-runs on your machine rather than in CI; the workflow checks everything else. See
-[AGENTS.md](AGENTS.md) for the rules this repository is worked under.
+runs on your machine rather than in CI. The workflow checks the manifest, that
+both shell scripts parse, `tools/svg2qml.py`, `tools/test.sh` and that the
+changelog has an `## [Unreleased]` section. See [AGENTS.md](AGENTS.md) for the
+rules this repository is worked under.
 
 ## License
 
