@@ -7,6 +7,21 @@ the only place a version number lives.
 
 ## [Unreleased]
 
+## [2.0.1]
+
+### Fixed
+
+- The panel could read a half-written `meta.json`. `meta.json` was rewritten by
+  truncating it and then writing the new content, and the panel watches that file
+  the same way it watches the event log, so a read landing in between saw an
+  empty file and treated the agent as having no workspace, no session and no
+  running state. Every write of the file now goes through a temporary file and a
+  rename, which is atomic, so a reader gets the old content or the new one.
+- The pinned workspace going missing was not only a panel problem. Three tests
+  covering it failed on a loaded CI runner and passed everywhere else, which is
+  the signature of a race rather than of a slow machine. The runner now has a
+  test that fails if a rewrite is ever readable half-written.
+
 ## [2.0.0]
 
 ### Changed

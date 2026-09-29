@@ -187,6 +187,61 @@ check "the big event is in the complete log too" \
   "$(jq -r 'select(.text|startswith("xxx")) | .text | length' \
       "$BOUND_STATE/agents/bound/events.jsonl")" "1500"
 
+# --- a watched file is never readable half-written ---------------------------
+
+# The panel watches meta.json through the same FileView as the log, and `> file`
+# truncates before the first byte of the new content lands. A reader in between
+# gets an empty file, and jq on an empty file answers nothing at all — which is
+# how a pinned workspace disappears for no reason. It is not a theory: it made
+# three tests fail on a loaded CI runner and nowhere else, and the panel is the
+# reader that actually matters.
+#
+# The helper is driven directly, in its own bash, because what it promises is
+# what a reader sees at the instant of the write. Run through the CLI the write
+# is finished before a caller could look, which is precisely why this went
+# unnoticed for so long. A truncate-then-write fails this within a few hundred
+# reads.
+#
+# The reader is builtins only, on purpose: `$(<file)` and a glob test cannot
+# fork, so a read that fails is a torn file and never a process that would not
+# start. A jq here would fail the whole run on a busy machine for no reason.
+atomic_reads=$(bash -c '
+  set -uo pipefail
+  source "$1"
+  target="$2"
+  mkdir -p "$(dirname "$target")"
+  # Seed it, so a read that finds no file at all is not counted as a tear: the
+  # claim under test is that a rewrite is never half-written, not that the file
+  # exists before the first write.
+  printf "{\"n\":0}\n" | write_atomic "$target"
+  torn=0
+  reads=0
+  (
+    for ((i = 0; i < 1000; i++)); do
+      printf "{\"n\":%s}\n" "$i" | write_atomic "$target"
+    done
+  ) &
+  writer=$!
+  while kill -0 "$writer" 2>/dev/null; do
+    if [[ -f "$target" ]]; then
+      reads=$((reads + 1))
+      [[ "$(<"$target")" == *\"n\":* ]] || torn=$((torn + 1))
+    fi
+  done
+  wait "$writer"
+  printf "%s %s" "$torn" "$reads"
+' _ "$AGENTTALK" "$ALT/atomic/meta.json")
+check "a meta.json rewrite is never readable half-written" \
+  "${atomic_reads%% *}" "0"
+# A test that stops reading early passes without having proved anything, so the
+# reader is required to have caught the file in flight a good number of times.
+check "the reader really did catch the file mid-flight" \
+  "$([[ "${atomic_reads##* }" -ge 500 ]] && echo yes)" "yes"
+check "the write that landed last is the one that is left" \
+  "$(jq -r '.n' "$ALT/atomic/meta.json")" "999"
+check "a write leaves no temporary file behind" \
+  "$(find "$ALT/atomic" -name 'meta.json.??????' | wc -l | tr -d ' ')" "0"
+
 # --- run --------------------------------------------------------------------
 
 printf 'do the thing' | AGENTTALK_OPENCODE_BIN="$STUB" \
