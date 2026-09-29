@@ -16,9 +16,18 @@ keeps going while you close the panel, change your theme, or restart your shell.
   `AGENTTALK_OPENCODE_BIN` replaces that search, and a value containing a `/` is
   taken as it stands, so a path that is wrong is an error rather than a silent
   fall back to something else.
+- `jq`, which the script uses for every piece of JSON it reads or writes. It is a
+  dependency of Omarchy itself, so it is already installed; it is named here
+  because a plugin that quietly needs a tool is worse than one that says so.
+- bash and the usual POSIX tools: `find`, `mktemp`, `awk`, `sed`, `readlink`,
+  `timeout`. `hyprctl` is asked where the focused window is working, and without
+  it every agent falls back to your home directory.
 
-AgentTalk does not need a build step, a runtime dependency, or a service. It is
-a bar widget plus one shell script, both of which ship inside the plugin.
+AgentTalk needs no build step, no service, and no second Quickshell process: it
+is a bar widget and one shell script, both of which ship inside the plugin and
+run in the shell process you already have. It writes to your home in one place,
+`~/.local/state/agenttalk`, and touches your Hyprland config only if you run
+`agenttalk bind` yourself.
 
 ## Install
 
