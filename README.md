@@ -207,6 +207,12 @@ is bigger than any transcript window. `panel.jsonl` is that log's last 256 KiB,
 which bounds what the panel loads however long the conversation gets;
 `events.jsonl` still holds every event, if you want to read one with `jq`.
 
+The cap holds at every moment, not just once the next event arrives: room is
+made in the file *before* the new event is written, because the panel reads that
+file the instant it changes. A single event larger than the whole 256 KiB is the
+one thing that cannot be shown — the panel says how large it was instead, and the
+event itself is in `events.jsonl` like everything else.
+
 Events are normalised to a handful of shapes — `user`, `text`, `tool`, `error`,
 `session`, `done` — so the panel never has to know opencode's internals. It
 also means a future opencode release cannot break the transcript by renaming a
@@ -267,8 +273,8 @@ What the script reads from the environment:
 | `AGENTTALK_OPENCODE_BIN` | opencode binary to use, in place of the search above |
 | `AGENTTALK_STATE_DIR` | state directory override |
 | `AGENTTALK_TIMEOUT` | seconds before a run is killed (default `3600`) |
-| `AGENTTALK_PANEL_LOG_MAX` | bytes `panel.jsonl` may reach before it is trimmed (default `262144`) |
-| `AGENTTALK_PANEL_LOG_KEEP` | bytes kept when it is trimmed (default `131072`) |
+| `AGENTTALK_PANEL_LOG_MAX` | bytes `panel.jsonl` may reach (default `262144`) |
+| `AGENTTALK_PANEL_LOG_KEEP` | bytes kept when the file has to make room (default `131072`) |
 | `HYPRLAND_CONFIG_DIR` | Hyprland config directory (default `~/.config/hypr`) |
 | `XDG_STATE_HOME` | parent of the state directory when `AGENTTALK_STATE_DIR` is unset |
 
