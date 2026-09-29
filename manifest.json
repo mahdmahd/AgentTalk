@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.ramackersjp.agenttalk",
   "name": "AgentTalk",
-    "version": "2.0.2",
+    "version": "2.0.3",
   "author": "J.P. Ramackers",
   "license": "MIT",
   "description": "Talk to your opencode agents from a panel in the Omarchy bar: type a task or paste an error, pick the agent, and watch it work.",

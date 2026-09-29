@@ -195,7 +195,7 @@ state directory, `agenttalk state-dir` prints it:
 ```
 $STATE/agents/<agent>/meta.json     session id, workdir, pid, exit code
 $STATE/agents/<agent>/events.jsonl  one normalised event per line, the whole
-                                    conversation, never trimmed
+                                    conversation, up to 8 MiB
 $STATE/agents/<agent>/panel.jsonl   the tail of that log, capped in bytes, and
                                     the only one the panel ever reads
 $STATE/agents/<agent>/stderr.log    raw stderr of the last run
@@ -207,11 +207,23 @@ is bigger than any transcript window. `panel.jsonl` is that log's last 256 KiB,
 which bounds what the panel loads however long the conversation gets;
 `events.jsonl` still holds every event, if you want to read one with `jq`.
 
-The cap holds at every moment, not just once the next event arrives: room is
+Every cap holds at every moment, not just once the next event arrives: room is
 made in the file *before* the new event is written, because the panel reads that
-file the instant it changes. A single event larger than the whole 256 KiB is the
-one thing that cannot be shown — the panel says how large it was instead, and the
-event itself is in `events.jsonl` like everything else.
+file the instant it changes. `events.jsonl` is bounded the same way, at 8 MiB,
+because a log nobody reads growing for as long as the conversation does is not
+the whole conversation, it is a leak.
+
+A single event is bounded too, at 64 KiB, and that one is enforced on the *read*:
+opencode's stream is taken a line at a time, and a model that answers with one
+enormous line — a file pasted into a tool result, a repetition that never stops —
+would otherwise have that line held in the worker, which outlives the run. So the
+line is read in pieces, dropped when it reaches the limit, and the transcript
+says an event was too large instead. Two things follow from that. A single event
+larger than the whole 256 KiB cannot be shown either: the panel says how large it
+was, and the event is in `events.jsonl` like everything else. And nothing is
+really lost by any of this — opencode keeps the full conversation in its own
+session, and these are the logs AgentTalk makes for reading, not a record of
+what happened.
 
 Events are normalised to a handful of shapes — `user`, `text`, `tool`, `error`,
 `session`, `done` — so the panel never has to know opencode's internals. It
@@ -275,6 +287,9 @@ What the script reads from the environment:
 | `AGENTTALK_TIMEOUT` | seconds before a run is killed (default `3600`) |
 | `AGENTTALK_PANEL_LOG_MAX` | bytes `panel.jsonl` may reach (default `262144`) |
 | `AGENTTALK_PANEL_LOG_KEEP` | bytes kept when the file has to make room (default `131072`) |
+| `AGENTTALK_EVENT_MAX` | bytes one event may reach, read and kept (default `65536`) |
+| `AGENTTALK_EVENTS_LOG_MAX` | bytes `events.jsonl` may reach (default `8388608`) |
+| `AGENTTALK_EVENTS_LOG_KEEP` | bytes kept when that file has to make room (default `4194304`) |
 | `HYPRLAND_CONFIG_DIR` | Hyprland config directory (default `~/.config/hypr`) |
 | `XDG_STATE_HOME` | parent of the state directory when `AGENTTALK_STATE_DIR` is unset |
 

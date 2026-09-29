@@ -64,6 +64,30 @@ PANEL_LOG_KEEP="${AGENTTALK_PANEL_LOG_KEEP:-131072}"
 PANEL_LOG_FLOOR=512
 ((PANEL_LOG_MAX > PANEL_LOG_FLOOR)) || PANEL_LOG_MAX="$PANEL_LOG_FLOOR"
 
+# The largest single event, in bytes, that is read, kept or shown. A model that
+# answers with one enormous line — a whole file in a tool result, a runaway
+# repetition — is not a reason for a process that outlives the run to grow without
+# limit, and a line has to be read before it can be judged, so the limit is on the
+# read and not only on what happens to the event afterwards.
+EVENT_MAX="${AGENTTALK_EVENT_MAX:-65536}"
+# A limit this small would be smaller than the note that reports an event over
+# it, and read -n 0 would never consume anything, so it is floored like the rest.
+((EVENT_MAX > PANEL_LOG_FLOOR)) || EVENT_MAX="$PANEL_LOG_FLOOR"
+# What read_bounded stops at. Same number as the event limit: a line this long is
+# not an event any more, it is a line that has to be taken apart.
+REPLY_MAX="$EVENT_MAX"
+
+# How large the complete log may get, and how much is kept when it is over. That
+# log is the whole conversation rather than the panel's window, so the numbers are
+# generous; they are here so that "the whole conversation" is a bounded thing
+# rather than a claim that gets slower and larger for as long as the disk lasts.
+EVENTS_LOG_MAX="${AGENTTALK_EVENTS_LOG_MAX:-8388608}"
+EVENTS_LOG_KEEP="${AGENTTALK_EVENTS_LOG_KEEP:-4194304}"
+# A single event has to fit in the log that keeps it, and the notes that stand in
+# for events have to fit in the log too, so both are floored rather than trusted.
+((EVENTS_LOG_MAX > EVENT_MAX + PANEL_LOG_FLOOR)) || EVENTS_LOG_MAX=$((EVENT_MAX + PANEL_LOG_FLOOR + PANEL_LOG_FLOOR))
+((EVENTS_LOG_KEEP > 0 && EVENTS_LOG_KEEP < EVENTS_LOG_MAX)) || EVENTS_LOG_KEEP=$((EVENTS_LOG_MAX / 2))
+
 log() { printf 'agenttalk: %s\n' "$*" >&2; }
 
 # A file the panel watches must never be readable half-written. `> file`
@@ -101,6 +125,59 @@ file_size() {
   stat -c%s "$path" 2>/dev/null || printf '0'
 }
 
+# The length of a string in bytes rather than in characters. ${#} counts
+# characters, so a cap measured with it is not a cap for a UTF-8 payload: it
+# undercounts by up to four and lets the file past the number it claims to hold.
+byte_length() {
+  LC_ALL=C printf '%s' "$1" | wc -c | tr -d ' \n'
+}
+
+# Read one line from stdin into $REPLY; non-zero return means the input is done.
+# Sets $reply_dropped when a line was too large to be one event and was not
+# returned, so a caller that has something to say about it can.
+#
+# `read` on its own holds a whole line, and a model that answers with one
+# enormous line — a file pasted into a tool result, a repetition that never
+# stops — would then have that line held here, in a process that outlives the run
+# and the model alike. `read -n` stops at the limit rather than at the newline, so
+# a long line arrives in pieces of at most $REPLY_MAX and nothing unbounded is
+# ever buffered. A piece that reaches the limit is an event over the limit by
+# definition: it is dropped, the rest of that line with it, and the caller is told.
+# The remainder of a JSON object is not JSON, so keeping it would only produce
+# noise. Fewer characters than the limit means the newline was reached and the
+# next line starts at the next read.
+read_bounded() {
+  local skip=0
+  reply_dropped=0
+  while IFS= read -r -n "$REPLY_MAX" REPLY || [[ -n "$REPLY" ]]; do
+    if ((skip)); then
+      ((${#REPLY} < REPLY_MAX)) && skip=0
+      continue
+    fi
+    if ((${#REPLY} == REPLY_MAX)); then
+      skip=1
+      reply_dropped=1
+      continue
+    fi
+    return 0
+  done
+  return 1
+}
+
+# The transcript's word for an event that is over the limit, whichever path it
+# arrived by and whichever loop noticed. One sentence, not one per caller: the
+# last two rounds of review were both about two copies of something disagreeing,
+# and a message the user reads is no place to start that again. The size is named
+# when the caller measured it and described as a lower bound when all the reader
+# knows is that it stopped at the limit.
+oversize_note() {
+  local size
+  if [[ -n "${1:-}" ]]; then size="an event of $1 bytes"; else size="an event of at least $EVENT_MAX bytes"; fi
+  jq -nc --arg size "$size" --arg max "$EVENT_MAX" \
+    '{t: "text", text: ("agenttalk: " + $size + " is over the " + $max + "-byte limit for one event, so it is not in this transcript; opencode still has it in full")}' \
+    2>/dev/null || true
+}
+
 # What the panel shows in place of an event that is larger than the whole panel
 # budget. The event stays in the complete log; this is a `text` event, so the
 # panel needs no new shape to draw it. A blank transcript would look like a
@@ -111,14 +188,14 @@ panel_standin() {
     '{t: "text", text: ("agenttalk: " + $n + " bytes of output are too large to show in the panel; the whole event is in events.jsonl")}'
 }
 
-# Cut the panel's log back to at most $2 bytes of its own tail. The caller says
+# Cut a log back to at most $2 bytes of its own tail. The caller says
 # how much room the event it is about to write needs, which is the whole point:
 # the newest event is written after the trim, so there is nothing here for a trim
 # to throw away and no window to widen when the tail comes back empty.
 #
 # The first line of a byte-tail is half a line, and the panel already skips a line
 # it cannot parse, so dropping it costs nothing and leaves whole lines behind.
-trim_panel_log() {
+trim_log() {
   local panel="$1" keep="$2" tmp
   ((keep > 0)) || keep=1
   tmp=$(mktemp "$panel.trim.XXXXXX") || return 1
@@ -131,30 +208,47 @@ trim_panel_log() {
 
 # Append one event to the complete log and to the panel's bounded view of it.
 #
-# The cap is settled before the write, never after it. The panel reads this file
-# the moment it changes, into the shell process that outlives everything else, so
-# a file that is briefly over the cap is a file that has already been read in
-# full: appending first and trimming afterwards bounds the log only in the state
-# nobody is looking at, and a single event larger than the cap made that state
-# last for as long as the trim took.
+# Every cap here is settled before the write, never after it. The panel reads its
+# log the moment it changes, into the shell process that outlives everything else,
+# so a file that is briefly over its cap is a file that has already been read in
+# full: appending first and trimming afterwards bounds a log only in the state
+# nobody is looking at.
 #
-# An event's exact length is the growth of events.jsonl, not ${#event}: that
-# counts characters, so undercounting a UTF-8 event is a cap that quietly does
-# not hold in any conversation that is not pure ASCII.
+# The length is measured in bytes before anything is written, not counted in
+# characters with ${#} and not derived from how much the file grew afterwards, so
+# the decision does not depend on a write that may be the thing being bounded.
 #
 # Prints the size of the panel log afterwards, so a caller appending in a loop
 # keeps a count without measuring the file itself on every event.
 append_event() {
   local dir="$1" event="$2" bytes="${3:-}" panel="$dir/panel.jsonl"
-  local before n keep
-  before=$(file_size "$dir/events.jsonl")
-  printf '%s\n' "$event" >>"$dir/events.jsonl"
-  n=$(( $(file_size "$dir/events.jsonl") - before ))
+  local events="$dir/events.jsonl" n keep
+
+  n=$(( $(byte_length "$event") + 1 ))
+
+  if ((n > EVENT_MAX)); then
+    # Past what a single event is allowed to be, whoever sent it: a runaway
+    # model, a whole file in a tool result, or a caller of `append` with a
+    # megabyte on its argument list. The transcript says so rather than carrying
+    # the payload, and opencode still holds the whole of it in its own session.
+    event=$(oversize_note "$n")
+    n=$(( $(byte_length "$event") + 1 ))
+  fi
+
+  # The complete log is bounded as well, for the same reason as the panel's copy:
+  # room is made before the write. A log that nobody reads growing for as long as
+  # the conversation does is not the whole conversation, it is a leak.
+  if (( $(file_size "$events") + n > EVENTS_LOG_MAX)); then
+    keep=$EVENTS_LOG_KEEP
+    ((keep < EVENTS_LOG_MAX - n)) || keep=$((EVENTS_LOG_MAX - n))
+    trim_log "$events" "$keep" || return 0
+  fi
+  printf '%s\n' "$event" >>"$events"
 
   if ((n > PANEL_LOG_MAX)); then
-    # Bigger than the entire budget, so no amount of trimming would make room
-    # for it. The panel gets the note in place of the whole log, written
-    # atomically so it is never seen empty.
+    # Bigger than the entire panel budget, so no amount of trimming makes room
+    # for it. The panel gets a note in place of the whole log, written atomically
+    # so it is never seen empty.
     write_atomic "$panel" <<<"$(panel_standin "$n")"
     file_size "$panel"
     return 0
@@ -167,7 +261,7 @@ append_event() {
     # event is kept: it is written once the file is already small enough.
     keep=$PANEL_LOG_KEEP
     ((keep < PANEL_LOG_MAX - n)) || keep=$((PANEL_LOG_MAX - n))
-    trim_panel_log "$panel" "$keep" || return 0
+    trim_log "$panel" "$keep" || return 0
     bytes=$(file_size "$panel")
   fi
   printf '%s\n' "$event" >>"$panel"
@@ -731,10 +825,17 @@ normalize_stream() {
      else empty end'
   )
   local line
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    jq -c "${filter[@]}" <<<"$line" 2>/dev/null || true
+  while read_bounded; do
+    if ((reply_dropped)); then
+      reply_dropped=0
+      oversize_note
+    fi
+    [[ -z "$REPLY" ]] && continue
+    jq -c "${filter[@]}" <<<"$REPLY" 2>/dev/null || true
   done
+  # An event that was too large and also the last thing in the stream is
+  # reported here: the loop above ends before it ever looked at the flag.
+  ((reply_dropped)) && { reply_dropped=0; oversize_note; }
 }
 
 # The detached half of `run`. Writes the session id, the running flag and the
@@ -850,7 +951,8 @@ worker() {
       < <(printf '%s' "$prompt")
   ) 2>"$dir/stderr.log" \
     | normalize_stream \
-    | while IFS= read -r event; do
+    | while read_bounded; do
+        event=$REPLY
         # `append_event` and not a second copy of the arithmetic: the two copies
         # disagreed about when the cap was enforced, and the copy in here was
         # the one that let an oversized event through.

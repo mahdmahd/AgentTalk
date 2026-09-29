@@ -287,6 +287,7 @@ watch_peak "$HUGE_LOG" 2000 "$STOP_FLAG" "$PEAK_OUT" &
 watcher=$!
 printf 'go' | AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$HUGE_STATE" \
   AGENTTALK_PANEL_LOG_MAX=2000 AGENTTALK_PANEL_LOG_KEEP=1000 STUB_HUGE=200000 \
+  AGENTTALK_EVENT_MAX=400000 \
   "$AGENTTALK" run huge >/dev/null 2>&1
 wait_for_event "$HUGE_EVENTS" done 1
 : >"$STOP_FLAG"
@@ -308,10 +309,83 @@ check "an event bigger than the whole budget is not shown whole" \
   "$(jq -r 'select((.text // "") | test("too large to show")) | .text' "$HUGE_LOG" | wc -l | tr -d ' ')" "1"
 check "the panel says how big it was instead of showing nothing" \
   "$(jq -r 'select((.text // "") | test("too large to show")) | .text' "$HUGE_LOG" | grep -c '200')" "1"
+# Legal as one event, too big for the panel: the complete log keeps all of it.
 check "the big event is in the complete log in full" \
   "$(jq -r 'select((.text // "") | length > 100000) | .text | length' "$HUGE_EVENTS")" "200000"
 check "the panel's log is small again once the run is over" \
   "$([[ "$(stat -c%s "$HUGE_LOG")" -lt 2000 ]] && echo yes)" "yes"
+
+# A line over the event limit is a line the worker cannot hold whole, so it is
+# read in pieces, dropped, and reported. The two lines after it in the stream
+# still have to arrive: a reader that takes a line apart and then loses track of
+# where the line ended would swallow them, and `wait_for_event` below would hang
+# rather than fail, which is why the run is bounded here.
+BIG_STATE="$ALT/big"
+BIG_LOG="$BIG_STATE/agents/big/events.jsonl"
+BIG_PANEL="$BIG_STATE/agents/big/panel.jsonl"
+printf 'go' | AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$BIG_STATE" \
+  STUB_HUGE=200000 \
+  "$AGENTTALK" run big >/dev/null 2>&1
+wait_for_event "$BIG_LOG" done 1
+check "a run with an over-long line still finished" \
+  "$(event_count "$BIG_LOG" done)" "1"
+check "the line after the over-long one arrived" \
+  "$(event_count "$BIG_LOG" error)" "1"
+check "an over-long event is not in the transcript in full" \
+  "$(jq -r 'select((.text // "") | length > 100000) | .text | length' "$BIG_LOG")" ""
+check "the transcript says an event was too large" \
+  "$(jq -r 'select((.text // "") | test("limit for one event")) | .text' "$BIG_LOG" | wc -l | tr -d ' ')" "1"
+check "the panel says the same" \
+  "$(jq -r 'select((.text // "") | test("limit for one event")) | .text' "$BIG_PANEL" | wc -l | tr -d ' ')" "1"
+check "the complete log is nowhere near the size of the line it dropped" \
+  "$([[ "$(stat -c%s "$BIG_LOG")" -lt 10000 ]] && echo yes)" "yes"
+
+# The complete log is bounded, and the bound is settled before the write rather
+# than after it, on the same terms as the panel's copy of it.
+GROW_STATE="$ALT/grow"
+GROW_LOG="$GROW_STATE/agents/grow/events.jsonl"
+GROW_PEAK="$ALT/grow-peak"
+rm -f "$GROW_PEAK" "$STOP_FLAG"
+watch_peak "$GROW_LOG" 2000 "$STOP_FLAG" "$GROW_PEAK" &
+grow_watcher=$!
+for i in $(seq 1 400); do
+  AGENTTALK_STATE_DIR="$GROW_STATE" AGENTTALK_EVENT_MAX=600 \
+    AGENTTALK_EVENTS_LOG_MAX=2000 AGENTTALK_EVENTS_LOG_KEEP=1000 \
+    "$AGENTTALK" append grow "{\"t\":\"text\",\"text\":\"event number $i in this conversation\"}" >/dev/null 2>&1
+done
+: >"$STOP_FLAG"
+wait "$grow_watcher"
+grow_read=$(<"$GROW_PEAK")
+grow_peak=${grow_read% *}
+grow_samples=${grow_read#* }
+check "the complete log never went over its own cap" \
+  "$([[ "$grow_peak" -le 2000 ]] && echo yes)" "yes"
+check "the sampler really did watch the complete log while it grew" \
+  "$([[ "$grow_samples" -ge 50 ]] && echo yes)" "yes"
+check "the newest event is still in the complete log" \
+  "$(jq -r 'select((.text // "") | test("event number 400")) | .text' "$GROW_LOG")" \
+  "event number 400 in this conversation"
+check "the oldest events are the ones that went" \
+  "$(jq -r 'select((.text // "") | test("event number 1 in")) | .text' "$GROW_LOG")" ""
+check "the trim left every line whole" \
+  "$(jq -c . "$GROW_LOG" >/dev/null 2>&1 && echo yes)" "yes"
+
+# `append` is the way in that does not go through the worker, so it is the only
+# way an event that is too big for one event reaches append_event, and it has to
+# be refused there as well.
+BIG_APPEND="$ALT/big-append"
+big_payload=$(printf 'y%.0s' $(seq 1 5000))
+AGENTTALK_STATE_DIR="$BIG_APPEND" AGENTTALK_EVENT_MAX=600 \
+  "$AGENTTALK" append loud "{\"t\":\"text\",\"text\":\"$big_payload\"}" >/dev/null 2>&1
+check "an event appended over the event limit is not stored whole" \
+  "$(jq -r 'select((.text // "") | length > 1000) | .text | length' \
+      "$BIG_APPEND/agents/loud/events.jsonl")" ""
+check "an event appended over the event limit says so instead" \
+  "$(jq -r 'select((.text // "") | test("limit for one event")) | .text' \
+      "$BIG_APPEND/agents/loud/events.jsonl" | wc -l | tr -d ' ')" "1"
+check "the panel is told the same thing" \
+  "$(jq -r 'select((.text // "") | test("limit for one event")) | .text' \
+      "$BIG_APPEND/agents/loud/panel.jsonl" | wc -l | tr -d ' ')" "1"
 
 # --- run --------------------------------------------------------------------
 

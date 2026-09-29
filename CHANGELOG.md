@@ -7,6 +7,26 @@ the only place a version number lives.
 
 ## [Unreleased]
 
+## [2.0.3]
+
+### Fixed
+
+- A single event had no limit of its own, and two things followed from that. The
+  worker read each line of opencode's stream whole before measuring anything, so
+  one oversized line — a file pasted into a tool result, a repetition that never
+  stops — was held in the process that outlives the run. The line is now read in
+  pieces with `read -n`, dropped when it reaches the limit, and the transcript
+  says an event was too large; the reader is one function used by both loops, so
+  the two cannot drift apart again.
+- `events.jsonl` grew for as long as the conversation did. It is the whole
+  transcript rather than the panel's window, so the cap is generous (8 MiB,
+  keeping 4), but it is a cap, and it is enforced before the write like the
+  panel's.
+- An event's length is now measured in bytes with `wc -c` before anything is
+  written, rather than counted in characters with `${#}` or inferred from how much
+  the file grew afterwards. `${#}` counts characters, so on a UTF-8 event the
+  measured size could be a quarter of the real one.
+
 ## [2.0.2]
 
 ### Fixed
