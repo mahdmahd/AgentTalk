@@ -1705,18 +1705,32 @@ Panel {
                       selectedTextColor: root.foreground
                     }
 
-                    // The whole answer at once, for pasting elsewhere. It only
-                    // shows on hover, so a transcript of long answers is not a
-                    // transcript of long buttons.
-                    Button {
-                      text: "copy"
-                      focusable: true
+                    // A tiny copy glyph, not a button: the block is the message,
+                    // and a full control chrome on every answer would shout
+                    // over all of them. It only shows on hover, and the flash
+                    // says when the clipboard has it.
+                    Text {
                       anchors.right: parent.right
                       anchors.bottom: parent.bottom
-                      anchors.rightMargin: Style.spacing.xs
-                      anchors.bottomMargin: Style.spacing.xs
+                      anchors.rightMargin: Style.spacing.sm
+                      anchors.bottomMargin: Style.spacing.sm
                       visible: answerHover.hovered
-                      onClicked: root.copyBlock(block.modelData)
+                      text: ""
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      color: copyHover.hovered ? root.foreground : root.dim
+
+                      HoverHandler {
+                        id: copyHover
+                      }
+
+                      MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -Style.spacing.xs
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.copyBlock(block.modelData)
+                      }
                     }
                   }
 
