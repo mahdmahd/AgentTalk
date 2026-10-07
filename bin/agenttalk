@@ -28,6 +28,8 @@
 #   init <agent...>               make sure session files exist
 #   append <agent> <json>         append one event to an agent's log
 #   run <agent> [options]         start a turn from a prompt on stdin (detached)
+#   models                          models opencode offers, as JSON
+#   model <agent> [model|--clear]   which model an agent uses (empty: opencode's)
 #   cd <agent> <dir|--window|--reset>  choose where that agent works
 #   complete [dir-prefix] [stem]       list directories for Tab completion
 #   clear <agent>                 forget the conversation
@@ -41,6 +43,8 @@
 #   AGENTTALK_OPENCODE_BIN  opencode binary to use (default: opencode)
 #   AGENTTALK_STATE_DIR     state directory override
 #   AGENTTALK_TIMEOUT       seconds before a run is killed (default: 3600)
+#   AGENTTALK_STDIN_TIMEOUT seconds to wait for the end of the prompt on stdin
+#                           before using what arrived (default: 5)
 #   HYPRLAND_CONFIG_DIR    Hyprland config directory (default: ~/.config/hypr)
 
 set -uo pipefail
@@ -384,6 +388,77 @@ cmd_agents() {
   printf ']\n'
 }
 
+# ---------------------------------------------------------------- models
+
+# The models opencode offers, one `provider/model` id per entry. opencode
+# prints them as plain lines, so anything that is not shaped like one is
+# skipped rather than passed on: a warning or a "nothing found" line is not a
+# model, and the panel would offer it as one.
+cmd_models() {
+  if ! resolve_opencode; then
+    echo '[]'
+    return 0
+  fi
+
+  local list
+  list=$("$RESOLVED_OPENCODE" models 2>/dev/null)
+  [[ -n "$list" ]] || { echo '[]'; return 0; }
+
+  local first=1
+  printf '['
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    [[ "$line" == */* ]] || continue
+    [[ "$line" == *[[:space:]]* ]] && continue
+    [[ $first -eq 0 ]] && printf ','
+    first=0
+    jq -nc --arg id "$line" --arg provider "${line%%/*}" --arg name "${line#*/}" \
+      '{id: $id, provider: $provider, name: $name}'
+  done <<<"$list"
+  printf ']\n'
+}
+
+# A model id is `provider/model`: one slash, nothing else, no spaces. Anything
+# else is a typo, and a typo caught here is a run that starts; caught at the
+# run, it is opencode's error in the transcript instead.
+valid_model() {
+  local model="${1:-}"
+  [[ -n "$model" ]] || return 1
+  [[ "$model" == */* ]] || return 1
+  [[ "$model" == *[[:space:]]* ]] && return 1
+  [[ "$model" == -* ]] && return 1
+  return 0
+}
+
+# Which model an agent runs with. Empty is opencode's own choice for that
+# agent, so clearing is a real setting and not the absence of one; it survives
+# a clear the way a pinned workspace does, because neither is the conversation.
+cmd_model() {
+  local agent="${1:-}" value="${2:-}"
+  local dir
+  dir=$(agent_dir "$agent") || return 1
+  [[ -f "$dir/meta.json" ]] || cmd_init "$agent" >/dev/null || return 1
+
+  if [[ -z "$value" && $# -lt 2 ]]; then
+    jq -r '.model // ""' "$dir/meta.json" 2>/dev/null
+    return 0
+  fi
+
+  case "$value" in
+    --clear|--default|"")
+      value=""
+      ;;
+    *)
+      valid_model "$value" || { log "model looks like provider/model, got: $value"; return 1; }
+      ;;
+  esac
+
+  jq -c --arg model "$value" '.model = $model' \
+    "$dir/meta.json" | write_atomic "$dir/meta.json" || return 1
+}
+
 # ---------------------------------------------------------------- doctor
 
 # What the panel would see if it asked right now. The panel has no way to show a
@@ -575,10 +650,11 @@ cmd_complete() {
 # spell this object out themselves, and `clear` kept the older spelling, so a
 # cleared conversation came back without its workspace keys at all.
 write_meta() {
-  local dir="${1:-}" agent="${2:-}" workdir="${3:-}" pinned="${4:-false}"
+  local dir="${1:-}" agent="${2:-}" workdir="${3:-}" pinned="${4:-false}" model="${5:-}"
   [[ "$pinned" == "true" ]] || pinned="false"
   jq -nc --arg agent "$agent" --arg workdir "$workdir" --argjson pinned "$pinned" \
-    '{agent: $agent, sessionID: "", workdir: $workdir, workdirPinned: $pinned, running: false, pid: 0, exitCode: null}' \
+    --arg model "$model" \
+    '{agent: $agent, sessionID: "", workdir: $workdir, workdirPinned: $pinned, model: $model, running: false, pid: 0, exitCode: null}' \
     | write_atomic "$dir/meta.json"
 }
 
@@ -752,11 +828,13 @@ cmd_clear() {
   # The workspace is not part of the conversation, so it survives a clear: a
   # user who pinned a directory did that on purpose, and "forget the
   # conversation" is not "forget where you were working". The pin has its own
-  # reset (`cd --reset`, the panel's reset button).
-  local workdir="" pinned=false
+  # reset (`cd --reset`, the panel's reset button). The model is the same kind
+  # of choice, so it survives the same way.
+  local workdir="" pinned=false model=""
   if [[ -f "$dir/meta.json" ]]; then
     workdir=$(jq -r '.workdir // ""' "$dir/meta.json" 2>/dev/null)
     pinned=$(jq -r '.workdirPinned // false' "$dir/meta.json" 2>/dev/null)
+    model=$(jq -r '.model // ""' "$dir/meta.json" 2>/dev/null)
   fi
   rm -f "$dir/events.jsonl" "$dir/panel.jsonl" "$dir/meta.json" "$dir/stderr.log"
   # A worker killed between mktemp and mv leaves its half-written meta.json
@@ -766,7 +844,7 @@ cmd_clear() {
   mkdir -p "$dir"
   : >"$dir/events.jsonl"
   : >"$dir/panel.jsonl"
-  write_meta "$dir" "${1:-}" "$workdir" "$pinned"
+  write_meta "$dir" "${1:-}" "$workdir" "$pinned" "$model"
 }
 
 # ------------------------------------------------------------------- stop
@@ -843,7 +921,7 @@ normalize_stream() {
 # through `finalize` so the panel can never be left showing a run that is not
 # running.
 worker() {
-  local agent="$1" prompt_file="$2" workdir="$3" auto="$4" fresh="$5"
+  local agent="$1" prompt_file="$2" workdir="$3" auto="$4" fresh="$5" model="${6:-}"
   local dir events meta panel panel_bytes
   dir=$(agent_dir "$agent") || return 1
   events="$dir/events.jsonl"
@@ -855,13 +933,19 @@ worker() {
   # conversation trims on its first event instead of waiting for its own.
   panel_bytes=$(file_size "$panel")
 
+  # An explicit `--model` wins for this run; otherwise the agent's own
+  # setting travels with it, exactly like the pinned workspace does.
+  if [[ -z "$model" && -f "$meta" ]]; then
+    model=$(jq -r '.model // ""' "$meta" 2>/dev/null || echo "")
+  fi
+
   # The worker is its own process, so it resolves opencode for itself: the
   # session it was spawned from may have been started from a different PATH.
   if ! resolve_opencode; then
     append_event "$dir" "$(jq -nc --arg t "$OPENCODE_BIN not found" '{t: "error", text: $t}')"
     append_event "$dir" "$(jq -nc '{t: "done", code: 127}')"
-    jq -nc --arg agent "$agent" \
-      '{agent: $agent, sessionID: "", workdir: "", workdirPinned: false, running: false, pid: 0, exitCode: 127}' \
+    jq -nc --arg agent "$agent" --arg model "$model" \
+      '{agent: $agent, sessionID: "", workdir: "", workdirPinned: false, model: $model, running: false, pid: 0, exitCode: 127}' \
       | write_atomic "$meta"
     return 127
   fi
@@ -895,6 +979,7 @@ worker() {
   [[ "$agent" != "" ]] && args+=(--agent "$agent")
   [[ -n "$session_id" ]] && args+=(--session "$session_id")
   [[ "$auto" == "true" ]] && args+=(--auto)
+  [[ -n "$model" ]] && args+=(--model "$model")
 
   local prompt
   prompt=$(cat "$prompt_file" 2>/dev/null)
@@ -918,12 +1003,13 @@ worker() {
 
   local current=""
   current=$(jq -c --arg agent "$agent" --arg workdir "$workdir" --arg session "$session_id" \
-    --argjson pinned "$pinned" \
+    --arg model "$model" --argjson pinned "$pinned" \
     '{
        agent: $agent,
        sessionID: $session,
        workdir: $workdir,
        workdirPinned: $pinned,
+       model: $model,
        running: true,
        pid: 0,
        startedAt: now,
@@ -977,7 +1063,7 @@ cmd_run() {
   # Only the agent is positional now; everything after it is an option, and the
   # prompt is not in argv at all.
   [[ $# -gt 0 ]] && shift
-  local auto="false" fresh="false" workdir=""
+  local auto="false" fresh="false" workdir="" model=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -985,19 +1071,36 @@ cmd_run() {
       --new) fresh="true" ;;
       --dir) workdir="${2:-}"; shift ;;
       --dir=*) workdir="${1#--dir=}" ;;
+      --model) model="${2:-}"; shift ;;
+      --model=*) model="${1#--model=}" ;;
       *) log "unknown option: $1" ;;
     esac
     shift
   done
 
   [[ -n "$agent" ]] || { log "run needs an agent id"; return 1; }
+  # A model that is not shaped like one is never going to run: fail before the
+  # prompt is read, not after opencode says so in the transcript. Empty means
+  # the agent's own setting, which the worker reads when it starts.
+  if [[ -n "$model" ]]; then
+    valid_model "$model" || { log "model looks like provider/model, got: $model"; return 1; }
+  fi
 
   # The prompt arrives on stdin, not as an argument. A task or a pasted stack
   # trace is the most private thing this plugin ever handles, and argv is world
   # readable: anyone on the machine could read it out of `ps` for as long as the
   # run lasted. stdin is a pipe, and a pipe is nobody else's business.
-  local prompt
-  prompt=$(cat)
+  #
+  # EOF is what says the prompt is complete, and the panel delivers it by
+  # closing stdin after the write. A caller that writes and forgets to close
+  # would block here forever: no run starts, no error prints, the panel simply
+  # sits silent with nothing to show. So the read also gives up after
+  # AGENTTALK_STDIN_TIMEOUT seconds and keeps whatever has arrived — past that
+  # point the stream has stopped, and waiting on it longer changes nothing but
+  # the time the user loses. A prompt that ends normally returns at EOF, which
+  # is immediate, so the limit is never what a working caller waits on.
+  local prompt=""
+  IFS= read -r -d '' -t "${AGENTTALK_STDIN_TIMEOUT:-5}" prompt || true
 
   [[ -n "${prompt//[[:space:]]/}" ]] || { log "run needs a prompt on stdin"; return 1; }
 
@@ -1045,7 +1148,7 @@ cmd_run() {
   : >"$dir/worker.log"
 
   local self="$0"
-  setsid nohup "$self" --worker "$agent" "$prompt_file" "$workdir" "$auto" "$fresh" \
+  setsid nohup "$self" --worker "$agent" "$prompt_file" "$workdir" "$auto" "$fresh" "$model" \
     >/dev/null 2>>"$dir/worker.log" </dev/null &
   disown 2>/dev/null || true
 }
@@ -1059,6 +1162,8 @@ main() {
     init) shift; cmd_init "$@" ;;
     append) shift; cmd_append "$@" ;;
     run) shift; cmd_run "$@" ;;
+    models) shift; cmd_models "$@" ;;
+    model) shift; cmd_model "$@" ;;
     clear) shift; cmd_clear "${1:-}" ;;
     stop) shift; cmd_stop "${1:-}" ;;
     cwd) shift; cmd_cwd "$@" ;;

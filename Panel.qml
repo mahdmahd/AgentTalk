@@ -152,6 +152,20 @@ Panel {
   }
   readonly property string workdir: selected ? selected.workdir : ""
   readonly property bool workdirPinned: !!(selected && selected.workdirPinned)
+  // The model the next run of the selected agent uses: the one picked for it,
+  // or empty for opencode's own choice. The worker reads the same setting from
+  // the agent's files, so sending needs no model argument of its own.
+  readonly property string selectedModel: selected && selected.model ? String(selected.model) : ""
+
+  // The picker writes `value` itself when something is chosen, which would
+  // silently replace a binding on it, so the value is pushed in when the
+  // selection changes instead of bound: switching agents, setting a model and
+  // resetting it all flow through selectedModel, and the trigger follows every
+  // one of them.
+  onSelectedModelChanged: {
+    if (modelPicker && modelPicker.value !== root.selectedModel)
+      modelPicker.value = root.selectedModel
+  }
   // The directory a run would use right now: the one the user pinned, else
   // whatever the panel setting forces, else the window they are on.
   readonly property string effectiveWorkdir: configuredWorkDir !== ""
@@ -165,6 +179,7 @@ Panel {
   onOpenedChanged: {
     if (opened) {
       refreshAgents()
+      refreshModels()
       editor.forceActiveFocus()
     }
   }
@@ -334,6 +349,10 @@ Panel {
     var args = ["run", selectedId]
     if (autoApprove) args.push("--auto")
     if (configuredWorkDir !== "") args.push("--dir", configuredWorkDir)
+    // The worker falls back to the agent's stored model on its own; passing
+    // it along as well means the run uses exactly what the row shows, even if
+    // the `model` write from a pick a moment ago has not landed yet.
+    if (root.selectedModel !== "") args.push("--model", root.selectedModel)
     startRun(args, text)
   }
 
@@ -487,6 +506,10 @@ Panel {
     if (runProcess.running) return
     runProcess.command = [cli].concat(args)
     runProcess.prompt = prompt
+    // The previous run closed stdin after its prompt went out, and write() is a
+    // no-op on a process whose stdin is still off, so it has to be back before
+    // the next launch.
+    runProcess.stdinEnabled = true
     runProcess.running = true
   }
 
@@ -527,6 +550,53 @@ Panel {
     }
   }
 
+  // -------------------------------------------------------------- model list
+  //
+  // The models opencode offers, as dropdown options. They are read once per
+  // panel open rather than per send: the list changes when providers do, not
+  // between turns, and `opencode models` answers in seconds, not milliseconds.
+
+  property var modelOptions: []
+
+  function refreshModels() {
+    if (modelsProcess.running) return
+    modelsProcess.running = true
+  }
+
+  function parseModelList(raw) {
+    var options = []
+    try {
+      var parsed = JSON.parse(String(raw || ""))
+      if (!Array.isArray(parsed)) return options
+      for (var i = 0; i < parsed.length; i++) {
+        var entry = parsed[i] || {}
+        if (entry.id) options.push({value: String(entry.id), label: String(entry.id)})
+      }
+    } catch (e) {
+      // No list is a list of none, not a panel that cannot open.
+    }
+    return options
+  }
+
+  function applyModels(options) {
+    modelOptions = options
+  }
+
+  // The model the selected agent runs with. Empty is opencode's own choice,
+  // so setting and clearing are the same command with different arguments,
+  // and the script keeps the choice next to the workspace pin.
+  function setModel(value) {
+    if (selectedId === "") return
+    var model = String(value || "")
+    report(["model", selectedId, model], function() {
+      root.flash(model === "" ? "back to opencode's default model" : "model set to " + model)
+    })
+  }
+
+  function resetModel() {
+    root.setModel("")
+  }
+
   Process {
     id: agentsProcess
     command: [root.cli, "agents"]
@@ -536,6 +606,17 @@ Panel {
     stdout: stdoutCollector
     stderr: stderrCollector
     onExited: function(code) { root.collect(agentsProcess, code, function(out) { root.applyAgents(root.parseAgentList(out)) }) }
+  }
+
+  Process {
+    id: modelsProcess
+    command: [root.cli, "models"]
+    running: false
+    property var stdoutCollector: StdioCollector { waitForEnd: true }
+    property var stderrCollector: StdioCollector { waitForEnd: true }
+    stdout: stdoutCollector
+    stderr: stderrCollector
+    onExited: function(code) { root.collect(modelsProcess, code, function(out) { root.applyModels(root.parseModelList(out)) }) }
   }
 
   Process {
@@ -587,6 +668,11 @@ Panel {
     onStarted: {
       write(prompt)
       prompt = ""
+      // `run` reads its prompt with `cat`, which only returns at EOF, and
+      // writing alone leaves the channel open: the command would wait forever
+      // for a close that never comes and no run would start. Dropping stdin
+      // here is what delivers the prompt; it is re-enabled by startRun().
+      stdinEnabled = false
     }
     property var stdoutCollector: StdioCollector { waitForEnd: true }
     property var stderrCollector: StdioCollector { waitForEnd: true }
@@ -892,8 +978,10 @@ Panel {
       // editor takes focus, then keeps its hands off — which is where the
       // prompt normally sits. The workspace field is a second place keys are
       // meant to land: Enter there commits a path, and it must not reach
-      // send() as well.
-      blocked: editor.activeFocus || workspaceField.activeFocus
+      // send() as well. The model picker's popup is its own window, so its
+      // keys never reach this catcher at all; the flag is only what keeps a
+      // Return pressed while choosing from also sending the prompt.
+      blocked: editor.activeFocus || workspaceField.activeFocus || modelPicker.popupOpen
 
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
@@ -1066,8 +1154,12 @@ Panel {
                   cursorShape: Qt.PointingHandCursor
                   onClicked: {
                     root.cursorIndex = agentRow.modelData.slot
-                    root.selectAgent(agentRow.agentId)
+                    // Focus before selecting: selectAgent() marks the agent read,
+                    // which rebuilds the rail and takes this delegate with it, so
+                    // an id looked up after it runs against a context that is
+                    // already gone and the editor never gets the keyboard.
                     editor.forceActiveFocus()
+                    root.selectAgent(agentRow.agentId)
                   }
                 }
               }
@@ -1392,6 +1484,60 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               elide: Text.ElideRight
+            }
+          }
+
+          // ---------------------------------------------------------------- model
+          //
+          // Which model the selected agent runs with. The picker lists what
+          // opencode offers, in the order it offers it; an
+          // empty choice is opencode's own default for the agent, and "default"
+          // puts it back there. Like the workspace pin, the choice is per agent
+          // and survives a clear, because neither of them is the conversation.
+          Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: Style.space(40)
+            color: root.normalFill
+            radius: Style.cornerRadius
+
+            RowLayout {
+              anchors.fill: parent
+              anchors.leftMargin: Style.spacing.sm
+              anchors.rightMargin: Style.spacing.xs
+              spacing: Style.spacing.xs
+
+              Text {
+                text: "MODEL"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 0.6
+              }
+
+              SearchableDropdown {
+                id: modelPicker
+                Layout.fillWidth: true
+                showLabel: false
+                enabled: root.selectedId !== ""
+                opacity: enabled ? 1 : root.disabledDim
+                options: root.modelOptions
+                triggerLabel: root.modelOptions.length === 0 ? "loading models…" : "opencode default"
+                placeholderText: "Search models…"
+                emptyText: "No model matches that"
+                fontFamily: root.fontFamily
+                foreground: root.foreground
+                accent: root.accent
+                onChanged: function(picked) { root.setModel(picked) }
+              }
+
+              Button {
+                text: "default"
+                focusable: true
+                enabled: root.selectedId !== "" && root.selectedModel !== ""
+                opacity: enabled ? 1 : root.disabledDim
+                onClicked: root.resetModel()
+              }
             }
           }
 

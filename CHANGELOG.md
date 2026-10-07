@@ -7,6 +7,25 @@ the only place a version number lives.
 
 ## [Unreleased]
 
+### Added
+
+- A `MODEL` row in the panel: pick which model the selected agent runs with
+  from what opencode offers, or `default` for opencode's own choice. The choice
+  is per agent and survives starting a fresh conversation, the way a pinned
+  workspace does. The script answers the same question from a terminal:
+  `agenttalk models` lists the offers as JSON, `agenttalk model <agent>
+  [model|--clear]` reads and writes the choice, and `agenttalk run` takes a
+  one-off `--model`.
+- `agenttalk run` stops waiting for the end of its prompt after five seconds
+  (`AGENTTALK_STDIN_TIMEOUT`) and uses what arrived. A caller that writes the
+  prompt and never closes stdin used to hang the panel silently forever: no run
+  started, nothing printed, nothing to show. A prompt that ends normally still
+  returns at EOF, which is immediate, so the limit is never what a working
+  caller waits on.
+- The panel closes stdin after writing the prompt. Quickshell's `Process.write`
+  leaves the channel open, and `run` reads the prompt with `cat`, which only
+  returns at EOF — every send from the panel hung before a run could start.
+
 ## [2.0.3]
 
 ### Fixed

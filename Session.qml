@@ -40,6 +40,12 @@ Item {
   // of the window they happened to be looking at. The panel shows a different
   // label for each, because only a pinned one survives moving to another window.
   readonly property bool workdirPinned: !!(meta && meta.workdirPinned === true)
+  // The model this agent runs with, or empty for opencode's own choice. It is
+  // a setting rather than conversation state: the model row shows it the way
+  // the workspace row shows the pin, and it is deliberately not part of the
+  // status key, because changing it must not rebuild the rail the user is
+  // looking at.
+  readonly property string model: (meta && meta.model) ? String(meta.model) : ""
   // Null until a run has finished once, which is the only difference between
   // "idle" and "never started" in the rail.
   readonly property int exitCode: (meta && meta.exitCode !== undefined && meta.exitCode !== null)

@@ -78,6 +78,7 @@ removing the plugin. Delete that directory to forget them.
 | Start a fresh conversation | `New`, in the header. The workspace stays where you put it |
 | Stop a running agent | `Stop`, in the header, while the agent is working |
 | Change where the next run happens | The `WORKSPACE` row: click the path, or `change…`, to type one; `window` to follow the focused window; `reset` to forget the pin |
+| Change which model an agent runs | The `MODEL` row: pick from what opencode offers, or `default` for opencode's own choice. The choice is per agent and survives `New` |
 | Close the panel | Escape, or click outside it |
 
 One conversation per agent, and they are independent: a `build` run keeps going
@@ -240,8 +241,13 @@ agenttalk agents                        # agents as JSON
 agenttalk run build < "add a test"      # start a turn, prompt on stdin
 agenttalk run build --dir ~/Code/project < "add a test"
 agenttalk run build --new < "add a test"  # new session instead of this one
+agenttalk run build --model opencode/muse-spark < "hi"  # one run on another model
+agenttalk models                        # models opencode offers, as JSON
+agenttalk model build                   # which model this agent uses (empty: default)
+agenttalk model build opencode/muse-spark  # pick one for this agent
+agenttalk model build --clear           # back to opencode's default
 agenttalk stop build                    # stop it
-agenttalk clear build                   # forget the conversation, keep the workspace
+agenttalk clear build                   # forget the conversation, keep workspace and model
 agenttalk cwd                           # working directory of the focused window
 agenttalk cd build ~/Code/project       # where that agent works from now on
 agenttalk cd build --window             # follow the focused window again

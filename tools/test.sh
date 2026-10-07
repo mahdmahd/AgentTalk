@@ -466,6 +466,91 @@ check "a multiline prompt survives the trip" \
   "$(recorded_stdin "$RECORD")" "line one
 line two"
 
+# --- models / model --------------------------------------------------------
+
+# A stub that lists models the way opencode does: one provider/model per line.
+# The blank line, the warning and the bare name are not models, and the panel
+# must never offer them as ones. For runs it records argv like the stdin stub.
+MODELS_STUB="$ALT/opencode-models"
+export MODELS_RECORD="$ALT/models-record.txt"
+cat >"$MODELS_STUB" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == "--version" ]] && { echo "0.0.0-stub"; exit 0; }
+if [[ "${1:-}" == "models" ]]; then
+  printf 'acme/alpha\n\nacme says hello\nacme/beta\nbare-name\n'
+  exit 0
+fi
+{
+  printf 'argv=%s\n' "$*"
+  printf 'stdin='
+  cat
+} >"$MODELS_RECORD"
+printf '%s\n' '{"type":"session","sessionID":"ses_stub"}'
+printf '%s\n' '{"type":"done"}'
+EOF
+chmod +x "$MODELS_STUB"
+
+check "models lists what opencode offers" \
+  "$(AGENTTALK_OPENCODE_BIN="$MODELS_STUB" "$AGENTTALK" models | jq -r '.[].id' | paste -sd' ' -)" \
+  "acme/alpha acme/beta"
+check "models splits provider and name" \
+  "$(AGENTTALK_OPENCODE_BIN="$MODELS_STUB" "$AGENTTALK" models | jq -r '.[1] | "\(.provider)/\(.name)"')" \
+  "acme/beta"
+
+EMPTY_MODELS_STUB="$ALT/opencode-no-models"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$EMPTY_MODELS_STUB"
+chmod +x "$EMPTY_MODELS_STUB"
+check "models with nothing listed is an empty list" \
+  "$(AGENTTALK_OPENCODE_BIN="$EMPTY_MODELS_STUB" "$AGENTTALK" models)" "[]"
+check "models without opencode is an empty list" \
+  "$(AGENTTALK_OPENCODE_BIN="$ALT/no-such-opencode" "$AGENTTALK" models)" "[]"
+
+MODEL_STATE="$ALT/state-model"
+check "a fresh agent has no model" \
+  "$(AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$MODEL_STATE" \
+      "$AGENTTALK" model build)" ""
+AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$MODEL_STATE" \
+  "$AGENTTALK" model build acme/alpha >/dev/null 2>&1
+check "model records the choice" \
+  "$(jq -r '.model' "$MODEL_STATE/agents/build/meta.json")" "acme/alpha"
+check "model prints the choice" \
+  "$(AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$MODEL_STATE" \
+      "$AGENTTALK" model build)" "acme/alpha"
+check "model rejects a bare name" \
+  "$(AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$MODEL_STATE" \
+      "$AGENTTALK" model build beta >/dev/null 2>&1; echo $?)" "1"
+AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$MODEL_STATE" \
+  "$AGENTTALK" model build --clear >/dev/null 2>&1
+check "model --clear puts the agent back on the default" \
+  "$(jq -r '.model' "$MODEL_STATE/agents/build/meta.json")" ""
+AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$MODEL_STATE" \
+  "$AGENTTALK" model build acme/alpha >/dev/null 2>&1
+AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$MODEL_STATE" \
+  "$AGENTTALK" clear build >/dev/null 2>&1
+check "clear keeps the model the way it keeps the pin" \
+  "$(jq -r '.model' "$MODEL_STATE/agents/build/meta.json")" "acme/alpha"
+
+MODEL_RUN_STATE="$ALT/state-model-run"
+printf 'hi' | AGENTTALK_OPENCODE_BIN="$MODELS_STUB" AGENTTALK_STATE_DIR="$MODEL_RUN_STATE" \
+  "$AGENTTALK" run build --dir "$TMP" --model acme/beta >/dev/null 2>&1
+wait_for_event "$MODEL_RUN_STATE/agents/build/events.jsonl" done 1
+check "an explicit --model reaches opencode" \
+  "$(grep -c -- '--model acme/beta' "$MODELS_RECORD")" "1"
+check "a run rejects a model that is not shaped like one" \
+  "$(printf 'hi' | AGENTTALK_OPENCODE_BIN="$MODELS_STUB" AGENTTALK_STATE_DIR="$MODEL_RUN_STATE" \
+      "$AGENTTALK" run build --model beta >/dev/null 2>&1; echo $?)" "1"
+
+MODEL_FALLBACK_STATE="$ALT/state-model-fallback"
+AGENTTALK_OPENCODE_BIN="$STUB" AGENTTALK_STATE_DIR="$MODEL_FALLBACK_STATE" \
+  "$AGENTTALK" model build acme/alpha >/dev/null 2>&1
+printf 'hi' | AGENTTALK_OPENCODE_BIN="$MODELS_STUB" AGENTTALK_STATE_DIR="$MODEL_FALLBACK_STATE" \
+  "$AGENTTALK" run build --dir "$TMP" >/dev/null 2>&1
+wait_for_event "$MODEL_FALLBACK_STATE/agents/build/events.jsonl" done 1
+check "a run without --model uses the agent's stored one" \
+  "$(grep -c -- '--model acme/alpha' "$MODELS_RECORD")" "1"
+check "a run keeps the stored model in the files" \
+  "$(jq -r '.model' "$MODEL_FALLBACK_STATE/agents/build/meta.json")" "acme/alpha"
+
 # --- cd ---------------------------------------------------------------------
 
 meta="$AGENTTALK_STATE_DIR/agents/build/meta.json"
@@ -615,7 +700,7 @@ check "clear keeps the pin marked" \
   "$(jq -r '.workdirPinned' "$AGENTTALK_STATE_DIR/agents/build/meta.json")" "true"
 check "clear writes every key the panel reads" \
   "$(jq -r 'keys | join(",")' "$AGENTTALK_STATE_DIR/agents/build/meta.json")" \
-  "agent,exitCode,pid,running,sessionID,workdir,workdirPinned"
+  "agent,exitCode,model,pid,running,sessionID,workdir,workdirPinned"
 AGENTTALK_OPENCODE_BIN="$STUB" "$AGENTTALK" cd build --reset >/dev/null 2>&1
 check "the pin can still be reset after a clear" \
   "$(jq -r '.workdirPinned' "$AGENTTALK_STATE_DIR/agents/build/meta.json")" "false"
