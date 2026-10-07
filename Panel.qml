@@ -1677,10 +1677,12 @@ Panel {
                       font.pixelSize: Style.font.body
                     }
 
-                    // A read-only editing surface, not a label: labels cannot
-                    // be selected, and an answer you cannot take with you is a
-                    // dead end. Drag to select, Ctrl+A/C work once it has the
-                    // focus; the copy button takes all of it without any.
+                    // Answers render as markdown, because that is what agents
+                    // write: bold, lists, code and headers come out formatted
+                    // instead of showing their markers. Prompts stay plain
+                    // text on purpose — a pasted error must read exactly as
+                    // typed, not reinterpreted. Copying still takes the raw
+                    // markdown, so the formatting survives the paste.
                     TextArea {
                       id: answer
                       anchors.left: parent.left
@@ -1696,7 +1698,7 @@ Panel {
                       topPadding: 0
                       bottomPadding: 0
                       text: root.blockText(block.modelData)
-                      textFormat: TextEdit.PlainText
+                      textFormat: TextEdit.MarkdownText
                       color: root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body

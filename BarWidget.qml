@@ -34,6 +34,13 @@ BarWidget {
   readonly property var artwork: Icon.paths
   readonly property bool hasArtwork: artwork.length > 0
 
+  // The state rides on the artwork: idle it wears the bar foreground, while
+  // an agent is working it wears the urgent colour, the same deal the button
+  // gives its glyph. The tooltip says which, for the moment colour alone does
+  // not convince.
+  readonly property color iconColor: button.active && button.useActiveColor
+    ? button.activeColor : button.foreground
+
   readonly property var panel: panelLoader.item
   readonly property bool anyRunning: panel ? panel.anyRunning : false
   readonly property bool opened: panel ? panel.opened === true : false
@@ -97,14 +104,14 @@ BarWidget {
           // The path data is data, not code: a fixed list of paths bound to
           // entries in assets/icon.js. Icons in this style are a handful of
           // filled shapes, and an entry that is not there draws nothing.
-          ArtPath { entry: 0; fillColor: button.foreground }
-          ArtPath { entry: 1; fillColor: button.foreground }
-          ArtPath { entry: 2; fillColor: button.foreground }
-          ArtPath { entry: 3; fillColor: button.foreground }
-          ArtPath { entry: 4; fillColor: button.foreground }
-          ArtPath { entry: 5; fillColor: button.foreground }
-          ArtPath { entry: 6; fillColor: button.foreground }
-          ArtPath { entry: 7; fillColor: button.foreground }
+          ArtPath { entry: 0; fillColor: root.iconColor }
+          ArtPath { entry: 1; fillColor: root.iconColor }
+          ArtPath { entry: 2; fillColor: root.iconColor }
+          ArtPath { entry: 3; fillColor: root.iconColor }
+          ArtPath { entry: 4; fillColor: root.iconColor }
+          ArtPath { entry: 5; fillColor: root.iconColor }
+          ArtPath { entry: 6; fillColor: root.iconColor }
+          ArtPath { entry: 7; fillColor: root.iconColor }
         }
 
         // Before the artwork is generated there is nothing to draw, so the
