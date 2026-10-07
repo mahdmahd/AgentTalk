@@ -541,6 +541,16 @@ Panel {
     return String(block.text)
   }
 
+  // The whole answer onto the clipboard at once, for pasting into a terminal
+  // or a bug report. Selecting part of one works too, straight on the text;
+  // this is the one click that takes all of it.
+  function copyBlock(block) {
+    var text = root.blockText(block)
+    if (text === "") return
+    Quickshell.clipboardText = text
+    root.flash("copied to clipboard")
+  }
+
   function parseAgentList(raw) {
     try {
       var parsed = JSON.parse(String(raw || ""))
@@ -1576,8 +1586,8 @@ Panel {
                   // what you said, in the directory you said it in
                   Rectangle {
                     visible: block.modelData.kind === "user"
-                    width: Math.min(parent.width, Math.max(prompt.implicitWidth, stamp.implicitWidth) + Style.space(28))
-                    height: prompt.implicitHeight
+                    width: Math.min(parent.width, Math.max(promptMeasure.implicitWidth, stamp.implicitWidth) + Style.space(28))
+                    height: prompt.contentHeight
                       + (stamp.visible ? stamp.implicitHeight + Style.spacing.xs : 0)
                       + Style.spacing.md
                     anchors.right: parent.right
@@ -1600,18 +1610,44 @@ Panel {
                       elide: Text.ElideLeft
                     }
 
+                    // Your words back to you, selectable for reuse elsewhere: a
+                    // label cannot be selected, so this is a read-only editing
+                    // surface. Drag to select; Ctrl+A/C work once it has the
+                    // focus, like any editor.
+                    //
+                    // The bubble hugs a hidden label, not the surface: a
+                    // wrapping surface measures itself against the width it is
+                    // given, so sizing the bubble from it is a loop.
                     Text {
+                      id: promptMeasure
+                      visible: false
+                      text: root.blockText(block.modelData)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                    }
+
+                    TextArea {
                       id: prompt
                       anchors.left: parent.left
                       anchors.right: parent.right
                       anchors.bottom: parent.bottom
                       anchors.margins: Style.spacing.sm
+                      readOnly: true
+                      selectByMouse: true
+                      persistentSelection: true
+                      background: null
+                      leftPadding: 0
+                      rightPadding: 0
+                      topPadding: 0
+                      bottomPadding: 0
                       text: root.blockText(block.modelData)
-                      textFormat: Text.PlainText
+                      textFormat: TextEdit.PlainText
                       color: root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
-                      wrapMode: Text.Wrap
+                      wrapMode: TextEdit.Wrap
+                      selectionColor: Style.selectionFillFor(root.foreground, root.accent)
+                      selectedTextColor: root.foreground
                     }
                   }
 
@@ -1619,23 +1655,68 @@ Panel {
                   // side of the conversation against the user's bright one.
                   Rectangle {
                     visible: block.modelData.kind === "text"
-                    width: Math.min(parent.width, answer.implicitWidth + Style.space(28))
-                    height: answer.implicitHeight + Style.spacing.md
+                    width: Math.min(parent.width, answerMeasure.implicitWidth + Style.space(28))
+                    height: answer.contentHeight + Style.spacing.md
                     color: root.hoverFill
                     radius: Style.cornerRadius
 
+                    // Hover only: a handler takes no clicks, so dragging to
+                    // select the answer still reaches the text underneath.
+                    HoverHandler {
+                      id: answerHover
+                    }
+
+                    // The bubble hugs a hidden label, not the surface: a
+                    // wrapping surface measures itself against the width it is
+                    // given, so sizing the bubble from it is a loop.
                     Text {
+                      id: answerMeasure
+                      visible: false
+                      text: root.blockText(block.modelData)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                    }
+
+                    // A read-only editing surface, not a label: labels cannot
+                    // be selected, and an answer you cannot take with you is a
+                    // dead end. Drag to select, Ctrl+A/C work once it has the
+                    // focus; the copy button takes all of it without any.
+                    TextArea {
                       id: answer
                       anchors.left: parent.left
                       anchors.right: parent.right
                       anchors.top: parent.top
                       anchors.margins: Style.spacing.sm
+                      readOnly: true
+                      selectByMouse: true
+                      persistentSelection: true
+                      background: null
+                      leftPadding: 0
+                      rightPadding: 0
+                      topPadding: 0
+                      bottomPadding: 0
                       text: root.blockText(block.modelData)
-                      textFormat: Text.PlainText
+                      textFormat: TextEdit.PlainText
                       color: root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
-                      wrapMode: Text.Wrap
+                      wrapMode: TextEdit.Wrap
+                      selectionColor: Style.selectionFillFor(root.foreground, root.accent)
+                      selectedTextColor: root.foreground
+                    }
+
+                    // The whole answer at once, for pasting elsewhere. It only
+                    // shows on hover, so a transcript of long answers is not a
+                    // transcript of long buttons.
+                    Button {
+                      text: "copy"
+                      focusable: true
+                      anchors.right: parent.right
+                      anchors.bottom: parent.bottom
+                      anchors.rightMargin: Style.spacing.xs
+                      anchors.bottomMargin: Style.spacing.xs
+                      visible: answerHover.hovered
+                      onClicked: root.copyBlock(block.modelData)
                     }
                   }
 
@@ -1671,16 +1752,27 @@ Panel {
                     elide: Text.ElideRight
                   }
 
-                  // what went wrong
-                  Text {
+                  // what went wrong, selectable like everything else: an error
+                  // is the thing most likely to be pasted somewhere.
+                  TextArea {
                     visible: block.modelData.kind === "error"
                     width: parent.width
+                    readOnly: true
+                    selectByMouse: true
+                    persistentSelection: true
+                    background: null
+                    leftPadding: 0
+                    rightPadding: 0
+                    topPadding: 0
+                    bottomPadding: 0
                     text: "⚠  " + root.blockText(block.modelData)
-                    textFormat: Text.PlainText
+                    textFormat: TextEdit.PlainText
                     color: root.urgentColor
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
-                    wrapMode: Text.Wrap
+                    wrapMode: TextEdit.Wrap
+                    selectionColor: Style.selectionFillFor(root.foreground, root.accent)
+                    selectedTextColor: root.foreground
                   }
                 }
               }
@@ -1712,34 +1804,59 @@ Panel {
               editor.activeFocus ? "focus" : "normal", root.foreground, root.accent)
             radius: Style.cornerRadius
 
-            TextArea {
-              id: editor
+            // A pasted stack trace is taller than this box, and a box that
+            // grows with it would eat the transcript. The text scrolls
+            // instead, and the view follows the caret as it moves.
+            Flickable {
+              id: editorFlick
               anchors.fill: parent
               anchors.margins: Style.spacing.xs
-              wrapMode: TextArea.Wrap
-              selectByMouse: true
-              background: null
-              color: root.foreground
-              selectionColor: Style.selectionFillFor(root.foreground, root.accent)
-              selectedTextColor: root.foreground
-              placeholderText: root.running
-                ? root.selectedId + " is working…"
-                : "Ask for a change, or paste the error you just hit. Enter sends."
-              placeholderTextColor: Qt.darker(root.foreground, 1.7)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
+              contentWidth: width
+              contentHeight: editor.contentHeight
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-              Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                  if (event.modifiers & Qt.ShiftModifier) return
-                  root.send()
-                  event.accepted = true
-                } else if (event.key === Qt.Key_Tab) {
-                  root.switchPanel(event.modifiers & Qt.ShiftModifier ? -1 : 1)
-                  event.accepted = true
-                } else if (event.key === Qt.Key_Escape) {
-                  root.close()
-                  event.accepted = true
+              TextArea {
+                id: editor
+                width: editorFlick.width
+                wrapMode: TextArea.Wrap
+                selectByMouse: true
+                background: null
+                color: root.foreground
+                selectionColor: Style.selectionFillFor(root.foreground, root.accent)
+                selectedTextColor: root.foreground
+                placeholderText: root.running
+                  ? root.selectedId + " is working…"
+                  : "Ask for a change, or paste the error you just hit. Enter sends."
+                placeholderTextColor: Qt.darker(root.foreground, 1.7)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+
+                Keys.onPressed: function(event) {
+                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                    if (event.modifiers & Qt.ShiftModifier) return
+                    root.send()
+                    event.accepted = true
+                  } else if (event.key === Qt.Key_Tab) {
+                    root.switchPanel(event.modifiers & Qt.ShiftModifier ? -1 : 1)
+                    event.accepted = true
+                  } else if (event.key === Qt.Key_Escape) {
+                    root.close()
+                    event.accepted = true
+                  }
+                }
+
+                // Keep the caret on screen: typing or arrowing past the edge
+                // pulls the view along, so the line being written is the line
+                // being seen.
+                onCursorRectangleChanged: {
+                  var top = editorFlick.contentY
+                  var bottom = top + editorFlick.height
+                  var caretTop = cursorRectangle.y
+                  var caretBottom = caretTop + cursorRectangle.height
+                  if (caretTop < top) editorFlick.contentY = caretTop
+                  else if (caretBottom > bottom) editorFlick.contentY = caretBottom - editorFlick.height
                 }
               }
             }

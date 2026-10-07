@@ -79,6 +79,8 @@ removing the plugin. Delete that directory to forget them.
 | Stop a running agent | `Stop`, in the header, while the agent is working |
 | Change where the next run happens | The `WORKSPACE` row: click the path, or `change…`, to type one; `window` to follow the focused window; `reset` to forget the pin |
 | Change which model an agent runs | The `MODEL` row: pick from what opencode offers, or `default` for opencode's own choice. The choice is per agent and survives `New` |
+| Copy an answer | Hover an answer and press `copy` for all of it, or drag across any message to select part of it |
+| Write a long prompt | The input box scrolls and follows the caret, so a pasted trace does not eat the transcript |
 | Close the panel | Escape, or click outside it |
 
 One conversation per agent, and they are independent: a `build` run keeps going
